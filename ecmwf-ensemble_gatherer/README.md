@@ -38,8 +38,11 @@ python ecmwf-ensemble_gatherer/download_pipeline.py --preset ifs-enfo-ep --date 
 Subset variables before downloading (uses the `.index` file + HTTP range requests):
 
 ```bash
-python ecmwf-ensemble_gatherer/download_pipeline.py --preset ifs-oper --date 2026-01-06 --run 00z --params t2m,tp,rh2m,u10,v10
+python ecmwf-ensemble_gatherer/download_pipeline.py --preset ifs-oper --date 2026-01-06 --run 00z --params t2m,tp,u10,v10
 ```
+
+Notes:
+- `rh2m` is commonly not present as a direct GRIB param in ENFO. If you pass `rh2m` here, the downloader includes `t2m` + `d2m` (`2t` + `2d`) so you can derive RH downstream.
 
 Limit by forecast steps (hours):
 

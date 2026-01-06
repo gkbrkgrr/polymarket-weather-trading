@@ -40,7 +40,7 @@ PRESETS: dict[str, dict[str, object]] = {
 
 PARAM_ALIASES: dict[str, str] = {
     "t2m": "2t",
-    "rh2m": "2r",
+    "d2m": "2d",
     "u10": "10u",
     "v10": "10v",
 }
@@ -149,6 +149,11 @@ def _parse_params(params: str | None) -> list[str] | None:
     out: list[str] = []
     for p in (x.strip().lower() for x in params.split(",")):
         if not p:
+            continue
+        if p == "rh2m":
+            # RH at 2m is not always present as a direct param in ECMWF open-data ENFO.
+            # Include the inputs needed to derive it downstream: t2m (2t) + d2m (2d).
+            out.extend(["2t", "2d"])
             continue
         out.append(PARAM_ALIASES.get(p, p))
     deduped = sorted(set(out))
@@ -479,7 +484,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         run = _parse_run(args.run)
 
     yyyymmdd = date.strftime("%Y%m%d")
-    dest_root = Path(args.dest_root) if args.dest_root else _repo_root() / "data/raster_data/ecmwf-ensemble"
+    dest_root = Path(args.dest_root) if args.dest_root else _repo_root() / "data/raster_data"
     dest_dir = dest_root / run / yyyymmdd
 
     remote_template = args.remote_dir_template
