@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+
+polymarket_archive.sqlite3
+*.sqlite3
+archiver.pid
+archiver.log
+archiver.*.log
+
+config.json
