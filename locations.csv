@@ -1,0 +1,9 @@
+name,url,lat_lon
+London,https://www.wunderground.com/history/daily/gb/london/EGLC,51.51N-0.03E
+NYC,https://www.wunderground.com/history/daily/us/ny/new-york-city/KLGA,40.76N-73.86W
+Atlanta,https://www.wunderground.com/history/daily/us/ga/atlanta/KATL,33.64N-84.41W
+Seattle,https://www.wunderground.com/history/daily/us/wa/seatac/KSEA,47.44N-122.3W
+Dallas,https://www.wunderground.com/history/daily/us/tx/dallas/KDAL,32.85N-96.87W
+Toronto,https://www.wunderground.com/history/daily/ca/mississauga/CYYZ,43.71N-79.66W
+Seoul,https://www.wunderground.com/history/daily/kr/incheon/RKSI,37.49N-126.49E
+BuenosAires,https://www.wunderground.com/history/daily/ar/ezeiza/SAEZ,34.79S-58.52W
