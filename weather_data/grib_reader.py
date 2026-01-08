@@ -3,10 +3,11 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Sequence
 
 import numpy as np
 import xarray as xr
@@ -114,6 +115,12 @@ class GribXarrayReader:
             "data/raster_data/ecmwf-ensemble/00z/20260106/20260106000000-0h-enfo-ef__params-10u-10v-2r-2t-tp.grib2",
             ["t2m", "tp", "rh2m", "u10", "v10"],
         )
+
+        # If your control (cf) and perturbations (pf) are split into separate files for the same step:
+        # ds_step0 = reader.read_ensemble_params_from_files(
+        #     ["/path/to/...-0h-...-cf.grib2", "/path/to/...-0h-...-pf.grib2"],
+        #     ["t2m", "tp", "u10", "v10"],
+        # )
     """
 
     def __init__(
@@ -449,6 +456,105 @@ class GribXarrayReader:
 
         return xr.Dataset(out)
 
+    def read_ensemble_params_from_files(
+        self,
+        paths: list[str | Path],
+        params: list[str],
+        *,
+        data_types: tuple[str, ...] = ("cf", "pf"),
+        filter_by_keys: dict[str, Any] | None = None,
+        engine: str = "cfgrib",
+        indexpath: str | Path | None = None,
+        member_dim: str = "number",
+        auto_fix_filter_by_keys: bool = True,
+    ) -> xr.Dataset:
+        """
+        Read ensemble parameters for a single forecast step across multiple GRIB2 files.
+
+        This is useful when control (`cf`) and perturbations (`pf`) are split into separate
+        files for the same timestep.
+        """
+        if not paths:
+            raise ValueError("paths cannot be empty")
+
+        requested: list[tuple[str, str]] = [(preferred_var_name(p), normalize_param(p)) for p in params]
+        base = dict(filter_by_keys or {})
+        base.pop("dataType", None)
+
+        by_short: dict[str, list[xr.DataArray]] = {sn: [] for _, sn in requested}
+
+        for path in paths:
+            for dt in data_types:
+                fbk = dict(base)
+                fbk["dataType"] = dt
+                dss = self.open_datasets(
+                    path,
+                    filter_by_keys=fbk,
+                    engine=engine,
+                    indexpath=indexpath,
+                    allow_empty=True,
+                )
+                for _, sn in requested:
+                    da = _find_by_short_name(dss, sn)
+                    if da is None and auto_fix_filter_by_keys:
+                        fbk2 = dict(fbk)
+                        fbk2.setdefault("shortName", sn)
+                        fixed = _maybe_fix_filter_by_keys(sn, fbk2)
+                        if fixed is not None:
+                            dss2 = self.open_datasets(
+                                path,
+                                filter_by_keys={k: v for k, v in fixed.items() if k != "shortName"},
+                                engine=engine,
+                                indexpath=indexpath,
+                                allow_empty=True,
+                            )
+                            da = _find_by_short_name(dss2, sn)
+                    if da is None:
+                        continue
+                    da = _canonicalize_grib_dataarray(da)
+                    da = _ensure_member_dim(da, member_dim)
+                    by_short[sn].append(da)
+
+        out: dict[str, xr.DataArray] = {}
+        for display_name, sn in requested:
+            if by_short.get(sn):
+                out[display_name] = _concat_member_arrays(by_short[sn], member_dim=member_dim)
+                continue
+
+            if display_name == "rh2m":
+                t2m = self._read_ensemble_short_name_from_files(
+                    paths,
+                    "2t",
+                    data_types=data_types,
+                    filter_by_keys=base,
+                    engine=engine,
+                    indexpath=indexpath,
+                    auto_fix_filter_by_keys=auto_fix_filter_by_keys,
+                    member_dim=member_dim,
+                )
+                try:
+                    d2m = self._read_ensemble_short_name_from_files(
+                        paths,
+                        "2d",
+                        data_types=data_types,
+                        filter_by_keys=base,
+                        engine=engine,
+                        indexpath=indexpath,
+                        auto_fix_filter_by_keys=auto_fix_filter_by_keys,
+                        member_dim=member_dim,
+                    )
+                except KeyError as e:
+                    raise KeyError(
+                        "rh2m derivation requires `d2m` (shortName '2d') to be present in the GRIB files. "
+                        "Include `d2m` when downloading/subsetting."
+                    ) from e
+                out[display_name] = derive_rh2m(t2m, d2m)
+                continue
+
+            raise KeyError(f"Param shortName {sn!r} not found in any of the provided files")
+
+        return xr.Dataset(out)
+
     def _read_ensemble_short_name(
         self,
         path: str | Path,
@@ -486,6 +592,39 @@ class GribXarrayReader:
         if len(arrays) == 1:
             return arrays[0]
         return xr.concat(arrays, dim=member_dim).sortby(member_dim)
+
+    def _read_ensemble_short_name_from_files(
+        self,
+        paths: list[str | Path],
+        short_name: str,
+        *,
+        data_types: tuple[str, ...],
+        filter_by_keys: dict[str, Any],
+        engine: str,
+        indexpath: str | Path | None,
+        auto_fix_filter_by_keys: bool,
+        member_dim: str = "number",
+    ) -> xr.DataArray:
+        arrays: list[xr.DataArray] = []
+        for path in paths:
+            try:
+                arrays.append(
+                    self._read_ensemble_short_name(
+                        path,
+                        short_name,
+                        data_types=data_types,
+                        filter_by_keys=filter_by_keys,
+                        engine=engine,
+                        indexpath=indexpath,
+                        auto_fix_filter_by_keys=auto_fix_filter_by_keys,
+                        member_dim=member_dim,
+                    )
+                )
+            except KeyError:
+                continue
+        if not arrays:
+            raise KeyError(f"Param shortName {short_name!r} not found in any of the provided files")
+        return _concat_member_arrays(arrays, member_dim=member_dim)
 
     def read_param_many(
         self,
@@ -621,6 +760,45 @@ def _ensure_member_dim(da: xr.DataArray, member_dim: str) -> xr.DataArray:
     return da.expand_dims({member_dim: [0]})
 
 
+def _concat_member_arrays(arrays: list[xr.DataArray], *, member_dim: str) -> xr.DataArray:
+    if not arrays:
+        raise ValueError("arrays cannot be empty")
+    if len(arrays) == 1:
+        return arrays[0]
+    combined = xr.concat(arrays, dim=member_dim)
+    if member_dim in combined.coords:
+        try:
+            member_vals = np.asarray(combined[member_dim].values).reshape(-1)
+            _, idx = np.unique(member_vals, return_index=True)
+            if len(idx) != len(member_vals):
+                combined = combined.isel({member_dim: np.sort(idx)})
+        except Exception:
+            pass
+    return combined.sortby(member_dim)
+
+
+_STEP_HOURS_RE = re.compile(r"-(?P<step>\d+)h-", re.IGNORECASE)
+
+
+def parse_step_hours_from_grib2_path(path: str | Path) -> int | None:
+    match = _STEP_HOURS_RE.search(Path(path).name)
+    if not match:
+        return None
+    return int(match.group("step"))
+
+
+def group_grib2_paths_by_step(paths: Sequence[str | Path]) -> dict[int, list[Path]]:
+    out: dict[int, list[Path]] = {}
+    for p in paths:
+        step = parse_step_hours_from_grib2_path(p)
+        if step is None:
+            continue
+        out.setdefault(step, []).append(Path(p))
+    for step, ps in out.items():
+        out[step] = sorted(ps)
+    return dict(sorted(out.items(), key=lambda kv: kv[0]))
+
+
 def _drop_problematic_coords(ds: xr.Dataset) -> xr.Dataset:
     drop = [c for c in _DROP_COORDS if c in ds.coords]
     if not drop:
@@ -649,3 +827,77 @@ def derive_rh2m(t2m_k: xr.DataArray, d2m_k: xr.DataArray) -> xr.DataArray:
         }
     )
     return rh
+
+
+@dataclass(frozen=True)
+class BBox:
+    """
+    Geographic bounding box.
+
+    Coordinates are in degrees. Longitudes may be specified either as [-180, 180]
+    or [0, 360]; `subset_bbox` attempts to reconcile them with the dataset's
+    longitude convention.
+    """
+
+    north: float
+    west: float
+    south: float
+    east: float
+
+
+def _wrap_lon_180(lon: float) -> float:
+    return ((lon + 180.0) % 360.0) - 180.0
+
+
+def _wrap_lon_360(lon: float) -> float:
+    return lon % 360.0
+
+
+def subset_bbox(
+    obj: xr.Dataset | xr.DataArray,
+    bbox: BBox,
+    *,
+    lat_name: str = "latitude",
+    lon_name: str = "longitude",
+) -> xr.Dataset | xr.DataArray:
+    """
+    Subset a GRIB-backed xarray object by lat/lon extent.
+
+    Note: this is a post-read subset; it does not reduce what must be downloaded
+    from upstream for a given GRIB message.
+    """
+
+    if lat_name not in obj.coords or lon_name not in obj.coords:
+        raise KeyError(f"Expected coords {lat_name!r} and {lon_name!r} to exist on the object")
+
+    lat_vals = np.asarray(obj.coords[lat_name].values, dtype=float)
+    lon_vals = np.asarray(obj.coords[lon_name].values, dtype=float)
+    if lat_vals.size == 0 or lon_vals.size == 0:
+        return obj
+
+    lat_desc = bool(lat_vals[0] > lat_vals[-1])
+    lat_slice = slice(bbox.north, bbox.south) if lat_desc else slice(bbox.south, bbox.north)
+
+    dataset_uses_360 = bool(np.nanmax(lon_vals) > 180.0)
+    west = float(bbox.west)
+    east = float(bbox.east)
+    if dataset_uses_360 and (west < 0.0 or east < 0.0):
+        west = _wrap_lon_360(west)
+        east = _wrap_lon_360(east)
+    elif (not dataset_uses_360) and (west > 180.0 or east > 180.0):
+        west = _wrap_lon_180(west)
+        east = _wrap_lon_180(east)
+
+    lon_min = float(np.nanmin(lon_vals))
+    lon_max = float(np.nanmax(lon_vals))
+
+    def _sel_lon_slice(w: float, e: float) -> xr.Dataset | xr.DataArray:
+        if w <= e:
+            return obj.sel({lat_name: lat_slice, lon_name: slice(w, e)})
+        # Dateline-crossing: stitch two slices.
+        left = obj.sel({lat_name: lat_slice, lon_name: slice(w, lon_max)})
+        right = obj.sel({lat_name: lat_slice, lon_name: slice(lon_min, e)})
+        combined = xr.concat([left, right], dim=lon_name)
+        return combined.sortby(lon_name)
+
+    return _sel_lon_slice(west, east)

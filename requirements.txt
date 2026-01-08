@@ -1,0 +1,8 @@
+numpy
+xarray
+cfgrib
+eccodes
+pandas
+
+# Needed for parquet outputs (e.g. `test.ipynb`, and `data_gatherer/observations_scraper.py --format parquet`)
+pyarrow

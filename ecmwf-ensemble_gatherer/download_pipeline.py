@@ -2,15 +2,18 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures as cf
 import datetime as dt
 import json
 import re
+import ssl
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
 from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from urllib.request import HTTPSHandler, Request, build_opener, install_opener, urlopen
 
 
 ECMWF_PORTAL_BASE = "https://data.ecmwf.int"
@@ -31,6 +34,11 @@ PRESETS: dict[str, dict[str, object]] = {
     "aifs-single-oper": {
         "remote_dir_template": "https://data.ecmwf.int/forecasts/{yyyymmdd}/{run}/aifs-single/0p25/oper/",
         "products": {"fc"},
+    },
+    # AIFS ensemble forecast (ENFO). Includes both control + perturbed members by default.
+    "aifs-enfo": {
+        "remote_dir_template": "https://data.ecmwf.int/forecasts/{yyyymmdd}/{run}/aifs-ens/0p25/enfo/",
+        "products": {"cf", "pf"},
     },
     "aifs-ens-cf": {
         "remote_dir_template": "https://data.ecmwf.int/forecasts/{yyyymmdd}/{run}/aifs-ens/0p25/enfo/",
@@ -259,6 +267,175 @@ def _download_with_resume(
             print(f"Download failed (attempt {attempt}/{retries}) for {dest.name}: {e}; retrying in {backoff}s")
             time.sleep(backoff)
 
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    tmp.replace(path)
+
+
+def _segment_ranges(total_size: int, *, connections: int) -> list[tuple[int, int]]:
+    if total_size <= 0:
+        raise ValueError("total_size must be > 0")
+    if connections <= 1:
+        return [(0, total_size - 1)]
+    connections = min(connections, total_size)  # avoid empty ranges
+    base = total_size // connections
+    rem = total_size % connections
+    out: list[tuple[int, int]] = []
+    start = 0
+    for i in range(connections):
+        size = base + (1 if i < rem else 0)
+        end = start + size - 1
+        out.append((start, end))
+        start = end + 1
+    if out[-1][1] != total_size - 1:
+        out[-1] = (out[-1][0], total_size - 1)
+    return out
+
+
+def _download_with_parallel_ranges(
+    url: str,
+    dest: Path,
+    *,
+    expected_size: int,
+    connections: int,
+    chunk_bytes: int,
+    timeout_s: int,
+    retries: int,
+) -> None:
+    """
+    Faster full-file download using multiple HTTP Range requests in parallel.
+
+    Writes directly into a pre-sized .part file and persists per-segment progress
+    in a sidecar JSON file to allow resume across runs.
+    """
+    if expected_size <= 0:
+        raise ValueError("expected_size must be > 0")
+    if connections <= 1:
+        _download_with_resume(
+            url,
+            dest,
+            expected_size=expected_size,
+            chunk_bytes=chunk_bytes,
+            timeout_s=timeout_s,
+            retries=retries,
+        )
+        return
+
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_suffix(dest.suffix + ".part")
+    meta = tmp.with_suffix(tmp.suffix + ".segments.json")
+
+    if dest.exists() and dest.stat().st_size == expected_size:
+        return
+
+    segments = _segment_ranges(expected_size, connections=connections)
+    done = [False] * len(segments)
+
+    def _load_meta() -> bool:
+        if not meta.exists() or not tmp.exists():
+            return False
+        if tmp.stat().st_size != expected_size:
+            return False
+        try:
+            payload = json.loads(meta.read_text(encoding="utf-8"))
+        except Exception:
+            return False
+        if payload.get("expected_size") != expected_size:
+            return False
+        saved = payload.get("segments")
+        if not isinstance(saved, list) or len(saved) != len(segments):
+            return False
+        try:
+            for i, s in enumerate(saved):
+                if (int(s["start"]), int(s["end"])) != segments[i]:
+                    return False
+                done[i] = bool(s.get("done", False))
+        except Exception:
+            return False
+        return True
+
+    def _write_meta() -> None:
+        payload = {
+            "expected_size": expected_size,
+            "segments": [
+                {"start": start, "end": end, "done": done_i}
+                for (start, end), done_i in zip(segments, done, strict=False)
+            ],
+        }
+        _atomic_write_text(meta, json.dumps(payload, sort_keys=True, separators=(",", ":")))
+
+    if not _load_meta():
+        with tmp.open("wb") as f:
+            f.truncate(expected_size)
+        for i in range(len(done)):
+            done[i] = False
+        _write_meta()
+
+    meta_lock = threading.Lock()
+
+    def _download_one_segment(idx: int, start: int, end: int) -> None:
+        if done[idx]:
+            return
+        length = end - start + 1
+        if length <= 0:
+            done[idx] = True
+            return
+
+        for attempt in range(1, retries + 1):
+            try:
+                headers = {
+                    "User-Agent": "polymarket-weather-trading/1.0",
+                    "Range": f"bytes={start}-{end}",
+                }
+                req = Request(url, headers=headers)
+                written = 0
+                with urlopen(req, timeout=timeout_s) as resp:
+                    status = getattr(resp, "status", 200)
+                    if status != 206:
+                        raise IOError(f"Server did not honor Range request (status={status}) for {dest.name}")
+                    with tmp.open("r+b") as f:
+                        f.seek(start)
+                        while True:
+                            chunk = resp.read(chunk_bytes)
+                            if not chunk:
+                                break
+                            f.write(chunk)
+                            written += len(chunk)
+
+                if written != length:
+                    raise IOError(
+                        f"Incomplete segment download for {dest.name}: wrote {written} != {length} bytes (range {start}-{end})"
+                    )
+
+                with meta_lock:
+                    done[idx] = True
+                    _write_meta()
+                return
+            except (HTTPError, URLError, TimeoutError, ConnectionError, IOError) as e:
+                if attempt >= retries:
+                    raise
+                backoff = min(60, 2**attempt)
+                time.sleep(backoff)
+
+    max_workers = min(connections, 64)
+    with cf.ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futures = [
+            ex.submit(_download_one_segment, i, start, end)
+            for i, (start, end) in enumerate(segments)
+            if not done[i]
+        ]
+        for fut in cf.as_completed(futures):
+            fut.result()
+
+    if not all(done):
+        raise IOError(f"Not all segments completed for {dest.name}")
+
+    meta.unlink(missing_ok=True)
+    tmp.replace(dest)
+
+
 def _index_url(grib2_url: str) -> str:
     if not grib2_url.endswith(".grib2"):
         raise ValueError(f"Expected .grib2 url, got: {grib2_url}")
@@ -440,6 +617,33 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--retries", type=int, default=5, help="Retries per file")
     p.add_argument("--chunk-mb", type=int, default=8, help="Download chunk size in MiB")
     p.add_argument(
+        "--ca-bundle",
+        default=None,
+        help="Path to a custom CA bundle (PEM) to trust for HTTPS (useful behind corporate proxies)",
+    )
+    p.add_argument(
+        "--insecure",
+        action="store_true",
+        help="Disable HTTPS certificate verification (unsafe; prefer --ca-bundle)",
+    )
+    p.add_argument(
+        "--workers",
+        type=int,
+        default=4,
+        help="Parallelize downloads across multiple files (1 = disable)",
+    )
+    p.add_argument(
+        "--connections-per-file",
+        type=int,
+        default=1,
+        help="For full-file downloads (no --params), use N parallel HTTP Range requests per file (1 = disable)",
+    )
+    p.add_argument(
+        "--keep-going",
+        action="store_true",
+        help="Keep downloading other files if a file fails; exits non-zero if any failures occur",
+    )
+    p.add_argument(
         "--max-total-gb",
         type=float,
         default=25.0,
@@ -474,6 +678,23 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
 
     now_utc = dt.datetime.now(dt.timezone.utc)
+    print_lock = threading.Lock()
+
+    def _log(msg: str) -> None:
+        with print_lock:
+            print(msg, flush=True)
+
+    if args.insecure and args.ca_bundle:
+        raise SystemExit("Use either --insecure or --ca-bundle (not both)")
+    if args.insecure:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        install_opener(build_opener(HTTPSHandler(context=ctx)))
+        _log("WARNING: HTTPS verification disabled via --insecure")
+    elif args.ca_bundle:
+        ctx = ssl.create_default_context(cafile=str(Path(args.ca_bundle).expanduser()))
+        install_opener(build_opener(HTTPSHandler(context=ctx)))
 
     if args.run is None:
         date, run = _auto_run(now_utc)
@@ -484,7 +705,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         run = _parse_run(args.run)
 
     yyyymmdd = date.strftime("%Y%m%d")
-    dest_root = Path(args.dest_root) if args.dest_root else _repo_root() / "data/raster_data"
+    dest_root = Path(args.dest_root) if args.dest_root else _repo_root() / "data/raster_data/ecmwf-ensemble"
     dest_dir = dest_root / run / yyyymmdd
 
     remote_template = args.remote_dir_template
@@ -518,6 +739,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if params is not None:
         print(f"Subset params: {', '.join(params)}")
+    if params is None and (args.workers or 1) > 1:
+        print(f"Workers: {args.workers}")
+    if params is None and (args.connections_per_file or 1) > 1:
+        print(f"Connections per file: {args.connections_per_file}")
 
     if args.dry_run:
         if params is None:
@@ -556,11 +781,24 @@ def main(argv: Sequence[str] | None = None) -> int:
     subset_limit_bytes = int(args.max_total_gb * 1024 * 1024 * 1024)
     subset_running_bytes = 0
 
-    for i, f in enumerate(files, start=1):
-        if params is None:
+    if params is None and args.workers > 1:
+        failures: list[tuple[str, str]] = []
+
+        def _download_one(i: int, f: RemoteGrib2) -> None:
             dest_path = dest_dir / f.name
             size_s = _fmt_bytes(f.size_bytes) if f.size_bytes is not None else "?"
-            print(f"[{i}/{len(files)}] {f.name} ({size_s})")
+            _log(f"[{i}/{len(files)}] {f.name} ({size_s})")
+            if args.connections_per_file > 1 and f.size_bytes is not None:
+                _download_with_parallel_ranges(
+                    f.url,
+                    dest_path,
+                    expected_size=f.size_bytes,
+                    connections=args.connections_per_file,
+                    chunk_bytes=args.chunk_mb * 1024 * 1024,
+                    timeout_s=args.timeout_s,
+                    retries=args.retries,
+                )
+                return
             _download_with_resume(
                 f.url,
                 dest_path,
@@ -569,6 +807,117 @@ def main(argv: Sequence[str] | None = None) -> int:
                 timeout_s=args.timeout_s,
                 retries=args.retries,
             )
+
+        with cf.ThreadPoolExecutor(max_workers=max(1, args.workers)) as ex:
+            future_map = {
+                ex.submit(_download_one, i, f): f
+                for i, f in enumerate(files, start=1)
+            }
+            for fut in cf.as_completed(future_map):
+                f = future_map[fut]
+                try:
+                    fut.result()
+                except Exception as e:
+                    failures.append((f.name, str(e)))
+                    _log(f"FAILED: {f.name}: {e}")
+                    if not args.keep_going:
+                        for other in future_map:
+                            other.cancel()
+                        break
+
+        if failures:
+            _log(f"{len(failures)} download(s) failed.")
+            return 4
+        return 0
+
+    if params is not None and args.workers > 1:
+        subset_jobs: list[tuple[int, RemoteGrib2, list[tuple[int, int]], int, str, Path]] = []
+        planned_total = 0
+
+        for i, f in enumerate(files, start=1):
+            parts, _subset_bytes = _read_index_parts(
+                f.url,
+                params=set(params),
+                steps=steps,
+                timeout_s=args.timeout_s,
+            )
+            if not parts:
+                _log(f"[{i}/{len(files)}] {f.name}: no matching index entries for params={params}")
+                continue
+            planned = _estimated_download_bytes(parts, merge_gap_bytes=args.subset_merge_gap_kb * 1024)
+            dest_name = _subset_output_name(f.name, params)
+            dest_path = dest_dir / dest_name
+            if dest_path.exists() and dest_path.stat().st_size == planned:
+                _log(f"[{i}/{len(files)}] {dest_name} already present ({_fmt_bytes(planned)})")
+                continue
+            subset_jobs.append((i, f, parts, planned, dest_name, dest_path))
+            planned_total += planned
+
+        if not args.force_large and planned_total > subset_limit_bytes:
+            print(
+                f"Refusing to download subset {_fmt_bytes(planned_total)} (exceeds --max-total-gb={args.max_total_gb}). "
+                f"Use --force-large to override, or reduce --steps / number of files."
+            )
+            return 3
+
+        failures: list[tuple[str, str]] = []
+
+        def _subset_one(job: tuple[int, RemoteGrib2, list[tuple[int, int]], int, str, Path]) -> None:
+            i, f, parts, planned, dest_name, dest_path = job
+            _log(f"[{i}/{len(files)}] {f.name} -> {dest_name} ({len(parts)} msgs, {_fmt_bytes(planned)})")
+            _download_ranges(
+                f.url,
+                dest_path,
+                parts=parts,
+                chunk_bytes=args.chunk_mb * 1024 * 1024,
+                timeout_s=args.timeout_s,
+                retries=args.retries,
+                merge_gap_bytes=args.subset_merge_gap_kb * 1024,
+            )
+
+        with cf.ThreadPoolExecutor(max_workers=max(1, args.workers)) as ex:
+            future_map = {ex.submit(_subset_one, job): job[1] for job in subset_jobs}
+            for fut in cf.as_completed(future_map):
+                f = future_map[fut]
+                try:
+                    fut.result()
+                except Exception as e:
+                    failures.append((f.name, str(e)))
+                    _log(f"FAILED: {f.name}: {e}")
+                    if not args.keep_going:
+                        for other in future_map:
+                            other.cancel()
+                        break
+
+        if failures:
+            _log(f"{len(failures)} download(s) failed.")
+            return 4
+        return 0
+
+    for i, f in enumerate(files, start=1):
+        if params is None:
+            dest_path = dest_dir / f.name
+            size_s = _fmt_bytes(f.size_bytes) if f.size_bytes is not None else "?"
+            print(f"[{i}/{len(files)}] {f.name} ({size_s})")
+            if args.connections_per_file > 1 and f.size_bytes is not None:
+                _download_with_parallel_ranges(
+                    f.url,
+                    dest_path,
+                    expected_size=f.size_bytes,
+                    connections=args.connections_per_file,
+                    chunk_bytes=args.chunk_mb * 1024 * 1024,
+                    timeout_s=args.timeout_s,
+                    retries=args.retries,
+                )
+            else:
+                _download_with_resume(
+                    f.url,
+                    dest_path,
+                    expected_size=f.size_bytes,
+                    chunk_bytes=args.chunk_mb * 1024 * 1024,
+                    timeout_s=args.timeout_s,
+                    retries=args.retries,
+                )
             continue
 
         parts, subset_bytes = _read_index_parts(
