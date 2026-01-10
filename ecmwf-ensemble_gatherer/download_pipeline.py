@@ -5,8 +5,10 @@ import argparse
 import concurrent.futures as cf
 import datetime as dt
 import json
+import random
 import re
 import ssl
+import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -20,6 +22,73 @@ ECMWF_PORTAL_BASE = "https://data.ecmwf.int"
 DEFAULT_REMOTE_DIR_TEMPLATE = (
     "https://data.ecmwf.int/forecasts/{yyyymmdd}/{run}/ifs/0p25/enfo/"
 )
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+_HTTP_THROTTLE_LOCK = threading.Lock()
+_HTTP_LAST_REQUEST_AT = 0.0
+_HTTP_MIN_INTERVAL_S = 0.0
+_HTTP_MAX_BACKOFF_S = 300
+
+
+def set_http_throttle(*, min_request_interval_ms: float) -> None:
+    """
+    Globally rate-limit outbound HTTP requests made by this module.
+
+    This is primarily to reduce 429 "Too Many Requests" when using many
+    HTTP Range requests (param subsetting via .index).
+    """
+    global _HTTP_MIN_INTERVAL_S
+    _HTTP_MIN_INTERVAL_S = max(0.0, float(min_request_interval_ms) / 1000.0)
+
+
+def set_http_retry_policy(*, max_backoff_s: int) -> None:
+    global _HTTP_MAX_BACKOFF_S
+    _HTTP_MAX_BACKOFF_S = max(1, int(max_backoff_s))
+
+
+def _throttled_urlopen(req: Request, *, timeout_s: int):
+    global _HTTP_LAST_REQUEST_AT
+    if _HTTP_MIN_INTERVAL_S > 0:
+        with _HTTP_THROTTLE_LOCK:
+            now = time.monotonic()
+            wait_s = _HTTP_MIN_INTERVAL_S - (now - _HTTP_LAST_REQUEST_AT)
+            if wait_s > 0:
+                time.sleep(wait_s)
+            # reserve the next "slot" based on start time
+            _HTTP_LAST_REQUEST_AT = time.monotonic()
+    return urlopen(req, timeout=timeout_s)
+
+
+def _retry_sleep_s(e: Exception, *, attempt: int, max_backoff_s: int) -> float:
+    """
+    Return how long to sleep before retrying after a network error.
+    """
+    max_backoff_s = max(1, int(max_backoff_s))
+
+    if isinstance(e, HTTPError) and int(getattr(e, "code", 0)) == 429:
+        retry_after = None
+        try:
+            retry_after = e.headers.get("Retry-After")
+        except Exception:
+            retry_after = None
+        if retry_after:
+            try:
+                return float(min(max_backoff_s, int(retry_after)))
+            except Exception:
+                pass
+        # Be much more conservative for 429 responses.
+        base = 10.0
+    else:
+        base = 1.0
+
+    # Exponential backoff with jitter.
+    delay = base * (2 ** max(1, int(attempt)))
+    delay = min(float(max_backoff_s), delay)
+    delay += random.uniform(0.0, min(1.0, delay / 10.0))
+    return delay
 
 PRESETS: dict[str, dict[str, object]] = {
     "ifs-enfo": {"remote_dir_template": "https://data.ecmwf.int/forecasts/{yyyymmdd}/{run}/ifs/0p25/enfo/"},
@@ -170,7 +239,7 @@ def _parse_params(params: str | None) -> list[str] | None:
 
 def _fetch_text(url: str, *, timeout_s: int) -> str:
     req = Request(url, headers={"User-Agent": "polymarket-weather-trading/1.0"})
-    with urlopen(req, timeout=timeout_s) as resp:
+    with _throttled_urlopen(req, timeout_s=timeout_s) as resp:
         return resp.read().decode("utf-8", errors="replace")
 
 
@@ -240,7 +309,7 @@ def _download_with_resume(
                 headers["Range"] = f"bytes={existing}-"
 
             req = Request(url, headers=headers)
-            with urlopen(req, timeout=timeout_s) as resp:
+            with _throttled_urlopen(req, timeout_s=timeout_s) as resp:
                 status = getattr(resp, "status", 200)
                 if existing > 0 and status == 200:
                     existing = 0
@@ -263,8 +332,8 @@ def _download_with_resume(
         except (HTTPError, URLError, TimeoutError, ConnectionError, IOError) as e:
             if attempt >= retries:
                 raise
-            backoff = min(60, 2**attempt)
-            print(f"Download failed (attempt {attempt}/{retries}) for {dest.name}: {e}; retrying in {backoff}s")
+            backoff = _retry_sleep_s(e, attempt=attempt, max_backoff_s=_HTTP_MAX_BACKOFF_S)
+            print(f"Download failed (attempt {attempt}/{retries}) for {dest.name}: {e}; retrying in {int(backoff)}s")
             time.sleep(backoff)
 
 
@@ -391,7 +460,7 @@ def _download_with_parallel_ranges(
                 }
                 req = Request(url, headers=headers)
                 written = 0
-                with urlopen(req, timeout=timeout_s) as resp:
+                with _throttled_urlopen(req, timeout_s=timeout_s) as resp:
                     status = getattr(resp, "status", 200)
                     if status != 206:
                         raise IOError(f"Server did not honor Range request (status={status}) for {dest.name}")
@@ -416,7 +485,7 @@ def _download_with_parallel_ranges(
             except (HTTPError, URLError, TimeoutError, ConnectionError, IOError) as e:
                 if attempt >= retries:
                     raise
-                backoff = min(60, 2**attempt)
+                backoff = _retry_sleep_s(e, attempt=attempt, max_backoff_s=_HTTP_MAX_BACKOFF_S)
                 time.sleep(backoff)
 
     max_workers = min(connections, 64)
@@ -458,7 +527,7 @@ def _read_index_parts(
     url = _index_url(grib2_url)
     req = Request(url, headers={"User-Agent": "polymarket-weather-trading/1.0"})
     parts: list[tuple[int, int]] = []
-    with urlopen(req, timeout=timeout_s) as resp:
+    with _throttled_urlopen(req, timeout_s=timeout_s) as resp:
         for raw in resp:
             line = raw.strip()
             if not line:
@@ -527,38 +596,51 @@ def _download_ranges(
     if dest.exists() and dest.stat().st_size == expected_size:
         return
 
-    for attempt in range(1, retries + 1):
-        try:
-            tmp.unlink(missing_ok=True)
-            with tmp.open("wb") as f:
-                for off, length in merged:
-                    start = off
-                    end = off + length - 1
+    tmp.unlink(missing_ok=True)
+    with tmp.open("wb") as f:
+        for r_i, (off, length) in enumerate(merged, start=1):
+            start = off
+            end = off + length - 1
+            for attempt in range(1, retries + 1):
+                write_pos = f.tell()
+                try:
                     headers = {
                         "User-Agent": "polymarket-weather-trading/1.0",
                         "Range": f"bytes={start}-{end}",
                     }
                     req = Request(url, headers=headers)
-                    with urlopen(req, timeout=timeout_s) as resp:
+                    with _throttled_urlopen(req, timeout_s=timeout_s) as resp:
                         status = getattr(resp, "status", 200)
                         if status != 206:
-                            raise IOError(f"Server did not honor Range request (status={status}) for {dest.name}")
+                            raise IOError(
+                                f"Server did not honor Range request (status={status}) for {dest.name} (range {start}-{end})"
+                            )
                         while True:
                             chunk = resp.read(chunk_bytes)
                             if not chunk:
                                 break
                             f.write(chunk)
+                    written = f.tell() - write_pos
+                    if written != length:
+                        raise IOError(
+                            f"Incomplete range download for {dest.name}: wrote {written} != {length} bytes (range {start}-{end})"
+                        )
+                    break
+                except (HTTPError, URLError, TimeoutError, ConnectionError, IOError) as e:
+                    f.seek(write_pos)
+                    f.truncate()
+                    if attempt >= retries:
+                        raise
+                    backoff = _retry_sleep_s(e, attempt=attempt, max_backoff_s=_HTTP_MAX_BACKOFF_S)
+                    print(
+                        f"Subset download failed ({dest.name}) range {r_i}/{len(merged)} "
+                        f"(attempt {attempt}/{retries}): {e}; retrying in {int(backoff)}s"
+                    )
+                    time.sleep(backoff)
 
-            if tmp.stat().st_size != expected_size:
-                raise IOError(f"Incomplete subset download for {dest.name}: {tmp.stat().st_size} != {expected_size}")
-            tmp.replace(dest)
-            return
-        except (HTTPError, URLError, TimeoutError, ConnectionError, IOError) as e:
-            if attempt >= retries:
-                raise
-            backoff = min(60, 2**attempt)
-            print(f"Subset download failed (attempt {attempt}/{retries}) for {dest.name}: {e}; retrying in {backoff}s")
-            time.sleep(backoff)
+    if tmp.stat().st_size != expected_size:
+        raise IOError(f"Incomplete subset download for {dest.name}: {tmp.stat().st_size} != {expected_size}")
+    tmp.replace(dest)
 
 
 def _fmt_bytes(n: int) -> str:
@@ -583,7 +665,7 @@ def _sum_sizes(files: Sequence[RemoteGrib2]) -> int:
 
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description="Download ECMWF IFS 0p25 ENFO (ensemble) GRIB2 files into data/raster_data/ecmwf-ensemble/<run>/<yyyymmdd>/",
+        description="Download ECMWF AIFS 0p25 OPER GRIB2 files into data/raster_data/ecmwf-aifs-single/<run>/<yyyymmdd>/",
     )
     p.add_argument(
         "--preset",
@@ -616,6 +698,18 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--timeout-s", type=int, default=60, help="HTTP timeout in seconds")
     p.add_argument("--retries", type=int, default=5, help="Retries per file")
     p.add_argument("--chunk-mb", type=int, default=8, help="Download chunk size in MiB")
+    p.add_argument(
+        "--min-request-interval-ms",
+        type=int,
+        default=0,
+        help="Throttle outbound HTTP requests (helps prevent 429 when doing many Range requests)",
+    )
+    p.add_argument(
+        "--max-backoff-s",
+        type=int,
+        default=300,
+        help="Maximum retry backoff in seconds (429 may require long sleeps)",
+    )
     p.add_argument(
         "--ca-bundle",
         default=None,
@@ -664,12 +758,33 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--dest-root",
         default=None,
-        help="Override destination root (default: <repo>/data/raster_data/ecmwf-ensemble)",
+        help="Override destination root (default: <repo>/data/raster_data/ecmwf-aifs-single)",
     )
     p.add_argument(
         "--remote-dir-template",
         default=DEFAULT_REMOTE_DIR_TEMPLATE,
         help="Remote directory template; variables: {yyyymmdd}, {run}",
+    )
+    p.add_argument(
+        "--spatial-subset",
+        action="store_true",
+        help="After download, write an additional GRIB2 cropped to an extent derived from --spatial-subset-locations (+margin)",
+    )
+    p.add_argument(
+        "--spatial-subset-locations",
+        default=str(_repo_root() / "locations.csv"),
+        help="locations.csv used to derive the spatial subset bbox (requires column 'lat_lon')",
+    )
+    p.add_argument("--spatial-margin-deg", type=float, default=2.0, help="Safety margin for spatial subset bbox (degrees)")
+    p.add_argument(
+        "--spatial-subset-suffix",
+        default="__bbox",
+        help="Filename suffix inserted before .grib2 for spatial subset outputs",
+    )
+    p.add_argument(
+        "--spatial-subset-delete-full",
+        action="store_true",
+        help="Delete the downloaded full GRIB2 after writing the spatial subset output",
     )
     return p
 
@@ -683,6 +798,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     def _log(msg: str) -> None:
         with print_lock:
             print(msg, flush=True)
+
+    set_http_throttle(min_request_interval_ms=float(args.min_request_interval_ms))
+    set_http_retry_policy(max_backoff_s=int(args.max_backoff_s))
 
     if args.insecure and args.ca_bundle:
         raise SystemExit("Use either --insecure or --ca-bundle (not both)")
@@ -705,8 +823,39 @@ def main(argv: Sequence[str] | None = None) -> int:
         run = _parse_run(args.run)
 
     yyyymmdd = date.strftime("%Y%m%d")
-    dest_root = Path(args.dest_root) if args.dest_root else _repo_root() / "data/raster_data/ecmwf-ensemble"
+    dest_root = Path(args.dest_root) if args.dest_root else _repo_root() / "data/raster_data/ecmwf-aifs-single"
     dest_dir = dest_root / run / yyyymmdd
+
+    bbox = None
+    if args.spatial_subset:
+        from weather_data.grib_spatial_subset import bbox_from_locations_csv
+
+        bbox = bbox_from_locations_csv(args.spatial_subset_locations, margin_deg=float(args.spatial_margin_deg))
+        _log(
+            "Spatial subset bbox: "
+            f"north={bbox.north:.4f}, south={bbox.south:.4f}, west={bbox.west:.4f}, east={bbox.east:.4f}"
+        )
+
+    def _spatial_subset_path(p: Path) -> Path:
+        name = p.name
+        if name.lower().endswith(".grib2"):
+            return p.with_name(name[:-6] + str(args.spatial_subset_suffix) + ".grib2")
+        return p.with_name(name + str(args.spatial_subset_suffix))
+
+    def _maybe_write_spatial_subset(p: Path) -> Path:
+        if not args.spatial_subset:
+            return p
+        if bbox is None:
+            raise RuntimeError("bbox not initialized")
+        out = _spatial_subset_path(p)
+        if out.exists():
+            return out
+        from weather_data.grib_spatial_subset import subset_grib2_file
+
+        subset_grib2_file(p, out, bbox=bbox, overwrite=True)
+        if args.spatial_subset_delete_full:
+            p.unlink(missing_ok=True)
+        return out
 
     remote_template = args.remote_dir_template
     products = _parse_products(args.products)
@@ -798,6 +947,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     timeout_s=args.timeout_s,
                     retries=args.retries,
                 )
+                _maybe_write_spatial_subset(dest_path)
                 return
             _download_with_resume(
                 f.url,
@@ -807,6 +957,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 timeout_s=args.timeout_s,
                 retries=args.retries,
             )
+            _maybe_write_spatial_subset(dest_path)
 
         with cf.ThreadPoolExecutor(max_workers=max(1, args.workers)) as ex:
             future_map = {
@@ -874,6 +1025,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 retries=args.retries,
                 merge_gap_bytes=args.subset_merge_gap_kb * 1024,
             )
+            _maybe_write_spatial_subset(dest_path)
 
         with cf.ThreadPoolExecutor(max_workers=max(1, args.workers)) as ex:
             future_map = {ex.submit(_subset_one, job): job[1] for job in subset_jobs}
@@ -918,6 +1070,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     timeout_s=args.timeout_s,
                     retries=args.retries,
                 )
+            _maybe_write_spatial_subset(dest_path)
             continue
 
         parts, subset_bytes = _read_index_parts(
@@ -952,6 +1105,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             retries=args.retries,
             merge_gap_bytes=args.subset_merge_gap_kb * 1024,
         )
+        _maybe_write_spatial_subset(dest_path)
 
     return 0
 

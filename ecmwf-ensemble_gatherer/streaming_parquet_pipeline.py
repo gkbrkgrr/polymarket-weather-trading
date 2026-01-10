@@ -28,6 +28,8 @@ def _build_parser() -> argparse.ArgumentParser:
         )
     )
 
+    default_process_params = "t2m,u10,v10,tp"
+
     p.add_argument("--preset", default="ifs-enfo", choices=sorted(dp.PRESETS.keys()))
     p.add_argument("--date", default="utc-today", help="YYYY-MM-DD, YYYYMMDD, or 'utc-today'")
     p.add_argument("--run", default=None, help="00/06/12/18 or 00z/06z/12z/18z (default: auto)")
@@ -35,8 +37,11 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--products", default=None, help="Comma-separated product types to include (e.g. ef,fc,cf,pf,ep)")
     p.add_argument(
         "--params",
-        default="t2m,u10,v10,tp",
-        help="Variables to download (subset) and write to parquet (e.g. 't2m,u10,v10,tp' or 't2m,tp,rh2m')",
+        default=None,
+        help=(
+            "Variables to write to parquet (e.g. 't2m,u10,v10,tp' or 't2m,tp,rh2m'). "
+            f"If omitted, downloads full GRIB files (no param subsetting) and processes defaults: {default_process_params}"
+        ),
     )
     p.add_argument(
         "--no-subset",
@@ -47,6 +52,18 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--timeout-s", type=int, default=60, help="HTTP timeout in seconds")
     p.add_argument("--retries", type=int, default=5, help="Retries per file")
     p.add_argument("--chunk-mb", type=int, default=8, help="Download chunk size in MiB")
+    p.add_argument(
+        "--min-request-interval-ms",
+        type=int,
+        default=0,
+        help="Throttle outbound HTTP requests (helps prevent 429 when doing many Range requests)",
+    )
+    p.add_argument(
+        "--max-backoff-s",
+        type=int,
+        default=300,
+        help="Maximum retry backoff in seconds (429 may require long sleeps)",
+    )
     p.add_argument("--ca-bundle", default=None, help="Path to a custom CA bundle (PEM) to trust for HTTPS")
     p.add_argument("--insecure", action="store_true", help="Disable HTTPS certificate verification (unsafe)")
     p.add_argument("--workers", type=int, default=4, help="Parallelize downloads across multiple files within a timestep")
@@ -63,7 +80,23 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--dest-root",
         default=None,
-        help="Override destination root for GRIB files (default: <repo>/data/raster_data/ecmwf-ensemble)",
+        help="Override destination root for GRIB files (default: <repo>/data/raster_data/ecmwf-aifs-single)",
+    )
+    p.add_argument(
+        "--spatial-subset",
+        action="store_true",
+        help="After download, write a bbox-cropped GRIB2 (from --locations + --spatial-margin-deg) and use it for processing",
+    )
+    p.add_argument("--spatial-margin-deg", type=float, default=2.0, help="Safety margin for spatial subset bbox (degrees)")
+    p.add_argument(
+        "--spatial-subset-suffix",
+        default="__bbox",
+        help="Filename suffix inserted before .grib2 for spatial subset outputs",
+    )
+    p.add_argument(
+        "--spatial-subset-delete-full",
+        action="store_true",
+        help="Delete the downloaded (non-spatial-subset) GRIB2 after writing the spatial subset output",
     )
 
     p.add_argument(
@@ -73,7 +106,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--point-output-dir",
-        default=str(dp._repo_root() / "data" / "point_data" / "ecmwf-ensemble"),
+        default=str(dp._repo_root() / "data" / "point_data" / "ecmwf-aifs-single"),
         help="Base output directory for per-city parquet files",
     )
     p.add_argument("--process-workers", type=int, default=1, help="Parallelize processing across timesteps (default: 1)")
@@ -83,6 +116,8 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def _split_csv(value: str) -> list[str]:
+    if value is None:
+        return []
     return [x.strip() for x in str(value).split(",") if x.strip()]
 
 
@@ -95,6 +130,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     def _log(msg: str) -> None:
         with print_lock:
             print(msg, flush=True)
+
+    dp.set_http_throttle(min_request_interval_ms=float(args.min_request_interval_ms))
+    dp.set_http_retry_policy(max_backoff_s=int(args.max_backoff_s))
 
     if args.insecure and args.ca_bundle:
         raise SystemExit("Use either --insecure or --ca-bundle (not both)")
@@ -117,7 +155,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         run = dp._parse_run(args.run)
 
     yyyymmdd = date.strftime("%Y%m%d")
-    dest_root = Path(args.dest_root) if args.dest_root else dp._repo_root() / "data" / "raster_data" / "ecmwf-ensemble"
+    dest_root = Path(args.dest_root) if args.dest_root else dp._repo_root() / "data" / "raster_data" / "ecmwf-aifs-single"
     dest_dir = dest_root / run / yyyymmdd
 
     products = dp._parse_products(args.products)
@@ -131,10 +169,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     name_regex = re.compile(args.name_regex) if args.name_regex else None
 
     # Use the download pipeline's param parsing so 'rh2m' expands to '2t'+'2d' for the subset download.
-    requested_params = _split_csv(args.params)
+    requested_params = _split_csv(args.params) or _split_csv("t2m,u10,v10,tp")
     download_params = None if args.no_subset else dp._parse_params(args.params)  # type: ignore[arg-type]
-    if not requested_params:
-        raise SystemExit("--params cannot be empty")
 
     files = dp.list_remote_grib2(
         remote_dir,
@@ -172,14 +208,48 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     dest_dir.mkdir(parents=True, exist_ok=True)
     coords = None
+    subset_bbox = None
     if not args.dry_run:
         from weather_data.grib_points import load_locations_coords, process_timestep_gribs_to_parquets
 
         coords = load_locations_coords(args.locations)
+        if args.spatial_subset:
+            from weather_data.grib_spatial_subset import bbox_from_locations_csv
+
+            subset_bbox = bbox_from_locations_csv(args.locations, margin_deg=float(args.spatial_margin_deg))
+            _log(
+                "Spatial subset bbox: "
+                f"north={subset_bbox.north:.4f}, south={subset_bbox.south:.4f}, west={subset_bbox.west:.4f}, east={subset_bbox.east:.4f}"
+            )
+
+    def _spatial_subset_path(p: Path) -> Path:
+        name = p.name
+        if name.lower().endswith(".grib2"):
+            return p.with_name(name[:-6] + str(args.spatial_subset_suffix) + ".grib2")
+        return p.with_name(name + str(args.spatial_subset_suffix))
+
+    def _maybe_write_spatial_subset(p: Path) -> Path:
+        if not args.spatial_subset:
+            return p
+        if subset_bbox is None:
+            raise RuntimeError("subset_bbox not initialized")
+        out = _spatial_subset_path(p)
+        if out.exists():
+            return out
+        from weather_data.grib_spatial_subset import subset_grib2_file
+
+        subset_grib2_file(p, out, bbox=subset_bbox, overwrite=True)
+        if args.spatial_subset_delete_full:
+            p.unlink(missing_ok=True)
+        return out
 
     def _download_one(step: int, f: dp.RemoteGrib2) -> Path | None:
         if download_params is None:
             dest_path = dest_dir / f.name
+            if args.spatial_subset_delete_full:
+                bbox_path = _spatial_subset_path(dest_path)
+                if bbox_path.exists():
+                    return bbox_path
             if args.connections_per_file > 1 and f.size_bytes is not None:
                 dp._download_with_parallel_ranges(
                     f.url,
@@ -199,7 +269,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     timeout_s=args.timeout_s,
                     retries=args.retries,
                 )
-            return dest_path
+            return _maybe_write_spatial_subset(dest_path)
 
         parts, _subset_bytes = dp._read_index_parts(
             f.url,
@@ -212,8 +282,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         planned = dp._estimated_download_bytes(parts, merge_gap_bytes=args.subset_merge_gap_kb * 1024)
         dest_name = dp._subset_output_name(f.name, download_params)
         dest_path = dest_dir / dest_name
+        if args.spatial_subset_delete_full:
+            bbox_path = _spatial_subset_path(dest_path)
+            if bbox_path.exists():
+                return bbox_path
         if dest_path.exists() and dest_path.stat().st_size == planned:
-            return dest_path
+            return _maybe_write_spatial_subset(dest_path)
         dp._download_ranges(
             f.url,
             dest_path,
@@ -223,7 +297,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             retries=args.retries,
             merge_gap_bytes=args.subset_merge_gap_kb * 1024,
         )
-        return dest_path
+        return _maybe_write_spatial_subset(dest_path)
 
     def _process_step(step: int, local_paths: list[Path]) -> list[Path]:
         if not local_paths:
