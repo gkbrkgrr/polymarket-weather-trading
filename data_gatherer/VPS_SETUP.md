@@ -3,7 +3,7 @@
 This repo runs a small Python process that periodically:
 
 1) discovers matching Polymarket markets (to catch new daily contracts), then  
-2) snapshots prices/metadata into a local SQLite DB file.
+2) snapshots prices/metadata into a local parquet dataset (partitioned by day).
 
 ## 1) Prereqs
 
@@ -26,10 +26,10 @@ From the `data_gatherer` directory:
 - `pip install -U pip`
 - `pip install .`
 
-## 4) Create config + initialize the DB
+## 4) Create config + initialize the archive
 
 - Copy `config.example.json` → `config.json` and adjust targets if needed.
-- Initialize tables:
+- Initialize the archive directory:
   - `polymarket-archiver --config ./config.json init-db`
 
 Optional: verify discovery finds markets:
@@ -63,8 +63,7 @@ Background (screen/tmux):
 
 ## Notes
 
-- The SQLite DB path defaults to `polymarket_archive.sqlite3` next to `config.json`.
+- The archive directory defaults to `../data/market_data/polymarket_archive` relative to `config.json`.
 - If you don’t want to store `config.json` in the repo folder, set:
-  - `POLYMARKET_ARCHIVE_DB_PATH=/path/to/polymarket_archive.sqlite3`
+  - `POLYMARKET_ARCHIVE_DIR=/path/to/polymarket_archive`
   - `POLYMARKET_DISCOVERY_MAX_PAGES=200` (or higher if needed)
-

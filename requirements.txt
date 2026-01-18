@@ -6,3 +6,9 @@ pandas
 
 # Needed for parquet outputs (e.g. `test.ipynb`, and `data_gatherer/observations_scraper.py --format parquet`)
 pyarrow
+
+# Needed for `scripts/forecast_reports.py`
+matplotlib
+
+# Used for hourly forecast imputation during GRIB -> parquet writes.
+scipy

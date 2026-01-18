@@ -1,0 +1,31 @@
+postgres_dsn: postgresql://archive_user:password@127.0.0.1:5432/polymarket_archive
+gamma_base_url: https://gamma-api.polymarket.com
+data_base_url: https://data-api.polymarket.com
+clob_base_url: https://clob.polymarket.com
+clob_ws_url: wss://ws-subscriptions-clob.polymarket.com/ws
+
+target_market_ids: []
+market_filters:
+  - science
+market_title_contains:
+  - temperature
+  - weather
+  - forecast
+  - rain
+  - snow
+  - wind
+  - humidity
+  - storm
+  - precipitation
+
+poll_interval_seconds: 300
+snapshot_interval_seconds: 30
+trades_page_size: 200
+markets_page_size: 500
+request_timeout_seconds: 20
+max_retries: 5
+book_snapshot_interval_seconds: 5
+
+raw_dir: data/raw
+log_level: INFO
+feature_clob: true

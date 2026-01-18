@@ -1,0 +1,28 @@
+[project]
+name = "polymarket-archive"
+version = "0.1.0"
+description = "Polymarket market data archive for weather forecasting trading"
+requires-python = ">=3.10"
+readme = "README.md"
+license = {text = "MIT"}
+authors = [{name = "Codex"}]
+
+dependencies = [
+    "httpx>=0.27",
+    "tenacity>=8.2",
+    "pydantic>=2.4",
+    "orjson>=3.9",
+    "psycopg[binary,pool]>=3.1",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+clob = ["websockets>=12.0"]
+parquet = ["pyarrow>=14.0"]
+test = ["pytest>=7.4", "pytest-asyncio>=0.23", "respx>=0.21"]
+
+[project.scripts]
+polymarket_archive = "polymarket_archive.cli:main"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
