@@ -1,8 +1,18 @@
+# Core data/archive dependencies (from pyproject.toml)
+httpx>=0.27
+tenacity>=8.2
+pydantic>=2.4
+orjson>=3.9
+psycopg[binary,pool]>=3.1
+pyyaml>=6.0
+
+# Weather data gathering + processing
 numpy
 xarray
 cfgrib
 eccodes
 pandas
+ecmwf-opendata
 
 # Needed for parquet outputs (e.g. `test.ipynb`, and `data_gatherer/observations_scraper.py --format parquet`)
 pyarrow

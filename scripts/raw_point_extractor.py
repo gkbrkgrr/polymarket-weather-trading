@@ -19,6 +19,7 @@ import xarray as xr
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+GRAVITY_M_S2 = 9.80665
 
 
 @dataclass(frozen=True)
@@ -243,6 +244,12 @@ def parse_init_and_lead_from_filename(model: str, path: Path) -> tuple[datetime,
             init = datetime.strptime(match.group(1), "%Y%m%d%H").replace(tzinfo=timezone.utc)
             lead = int(match.group(2))
             return init, lead
+    if model == "ecmwf-aifs-single":
+        match = re.search(r"ecmwf-aifs-single-[^_]+_(\d{10})_(\d{3})\.grib2$", name)
+        if match:
+            init = datetime.strptime(match.group(1), "%Y%m%d%H").replace(tzinfo=timezone.utc)
+            lead = int(match.group(2))
+            return init, lead
 
     match_init = re.search(r"(\d{10})", name)
     match_lead = re.search(r"(?:_f|_)(\d{3})(?=\\.grib2$)", name)
@@ -291,6 +298,22 @@ def download_cycle(*, model: str, cycle: str, max_step_hours: int, step_interval
             str(script),
             "--cycle",
             cycle,
+            "--model",
+            "ecmwf-hres",
+            "--max-step-hours",
+            str(max_step_hours),
+            "--step-interval-hours",
+            str(step_interval_hours),
+        ]
+    elif model == "ecmwf-aifs-single":
+        script = REPO_ROOT / "data_gatherer" / "ecmwf_forecast_gatherer" / "ecmwf_forecast_download.py"
+        cmd = [
+            sys.executable,
+            str(script),
+            "--cycle",
+            cycle,
+            "--model",
+            "ecmwf-aifs-single",
             "--max-step-hours",
             str(max_step_hours),
             "--step-interval-hours",
@@ -337,7 +360,15 @@ def build_point_records(
                 grib_path, short_name="2t", type_of_level="heightAboveGround", level=2
             )
             lats_t, lons_t, t_stack = open_pressure_stack(grib_path, short_name="t")
-            lats_gh, lons_gh, gh_stack = open_pressure_stack(grib_path, short_name="gh")
+            gh_short = "z" if model == "ecmwf-aifs-single" else "gh"
+            lats_gh, lons_gh, gh_stack_raw = open_pressure_stack(grib_path, short_name=gh_short)
+
+            if model == "ecmwf-aifs-single":
+                gh_stack: dict[int, np.ndarray] = {}
+                for lvl, z_grid in gh_stack_raw.items():
+                    gh_stack[lvl] = np.divide(z_grid, GRAVITY_M_S2, dtype=float)
+            else:
+                gh_stack = gh_stack_raw
 
             if not (np.array_equal(lats2, lats_t) and np.array_equal(lats2, lats_gh)):
                 raise ValueError(f"Latitude grids differ in {grib_path}")
@@ -491,19 +522,19 @@ def write_or_append_parquet(
 
 
 def default_grib_dir(model: str, cycle: str) -> Path:
-    if model not in {"ecmwf-hres", "gfs"}:
-        raise ValueError("--model must be one of: ecmwf-hres, gfs")
+    if model not in {"ecmwf-hres", "ecmwf-aifs-single", "gfs"}:
+        raise ValueError("--model must be one of: ecmwf-hres, ecmwf-aifs-single, gfs")
     return REPO_ROOT / "data" / "raster_data" / model / cycle
 
 
 def main(argv: list[str]) -> int:
     p = argparse.ArgumentParser(
         description=(
-            "Bilinearly interpolate GRIB2 fields (2t/t/gh) onto locations.csv points, "
+            "Bilinearly interpolate GRIB2 fields (2t/t/gh or 2t/t/z) onto locations.csv points, "
             "then write/append a parquet in data/point_data/<model>/raw/."
         )
     )
-    p.add_argument("--model", required=True, choices=["ecmwf-hres", "gfs"])
+    p.add_argument("--model", required=True, choices=["ecmwf-hres", "ecmwf-aifs-single", "gfs"])
     p.add_argument("--cycle", help="Init time (UTC) in YYYYMMDDHH; also used for default GRIB dir")
     p.add_argument("--download", action="store_true", help="Download GRIB2 files for --cycle first")
     p.add_argument("--max-step-hours", type=int, default=96)
@@ -514,7 +545,7 @@ def main(argv: list[str]) -> int:
     p.add_argument("--verbose", action="store_true")
     args = p.parse_args(argv)
 
-    if args.model in {"ecmwf-hres", "gfs"}:
+    if args.model in {"ecmwf-hres", "ecmwf-aifs-single", "gfs"}:
         conda_env = os.environ.get("CONDA_DEFAULT_ENV")
         running_in_mto = Path(sys.prefix).name == "mto" or "/envs/mto" in sys.prefix
         if conda_env and conda_env != "mto" and not running_in_mto:
