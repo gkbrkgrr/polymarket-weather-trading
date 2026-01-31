@@ -21,6 +21,25 @@ from polymarket_archive.ingest_trades import ingest_trades_for_market
 from polymarket_archive.raw_sink import RawSink
 
 
+def _title_filters(settings: Settings) -> list[str]:
+    terms: list[str] = []
+    for term in settings.market_title_contains:
+        value = str(term).strip()
+        if value:
+            terms.append(value)
+    if settings.title_filter and str(settings.title_filter).strip():
+        terms.append(str(settings.title_filter).strip())
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for term in terms:
+        lower = term.lower()
+        if lower in seen:
+            continue
+        seen.add(lower)
+        deduped.append(term)
+    return deduped
+
+
 async def run_backfill(
     settings: Settings,
     db: Database,
@@ -41,8 +60,14 @@ async def run_backfill(
         async def _on_batch(batch) -> None:
             await ingest_markets(db, batch)
 
+        title_filters = _title_filters(settings)
         markets = await discover_markets(
-            gamma, settings.title_filter, settings.markets_page_size, on_batch=_on_batch
+            gamma,
+            title_filters,
+            settings.market_filters,
+            settings.target_market_ids,
+            settings.markets_page_size,
+            on_batch=_on_batch,
         )
         await _ingest_trades_concurrently(
             db, data, markets, start_ts, end_ts, settings.concurrency, settings.trades_page_size
@@ -64,8 +89,14 @@ async def run_live_once(settings: Settings, db: Database, run_id: str | None = N
         async def _on_batch(batch) -> None:
             await ingest_markets(db, batch)
 
+        title_filters = _title_filters(settings)
         await discover_markets(
-            gamma, settings.title_filter, settings.markets_page_size, on_batch=_on_batch
+            gamma,
+            title_filters,
+            settings.market_filters,
+            settings.target_market_ids,
+            settings.markets_page_size,
+            on_batch=_on_batch,
         )
         market_ids = await db.list_market_condition_ids()
         await _ingest_trades_for_market_ids(
@@ -146,8 +177,14 @@ async def run_live_loop(settings: Settings, db: Database) -> None:
                 async def _on_batch(batch) -> None:
                     await ingest_markets(db, batch)
 
+                title_filters = _title_filters(settings)
                 await discover_markets(
-                    gamma, settings.title_filter, settings.markets_page_size, on_batch=_on_batch
+                    gamma,
+                    title_filters,
+                    settings.market_filters,
+                    settings.target_market_ids,
+                    settings.markets_page_size,
+                    on_batch=_on_batch,
                 )
                 last_discovery = now
                 if settings.feature_clob:

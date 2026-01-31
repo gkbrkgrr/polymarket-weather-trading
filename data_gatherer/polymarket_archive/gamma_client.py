@@ -151,6 +151,42 @@ def _normalize_outcomes(payload: dict[str, Any]) -> list[Any]:
     return []
 
 
-def filter_markets(markets: Iterable[GammaMarket], title_filter: str) -> list[GammaMarket]:
-    needle = title_filter.lower()
-    return [market for market in markets if needle in market.title.lower()]
+def _extract_categories(payload: dict[str, Any]) -> list[str]:
+    candidates: list[str] = []
+    raw_value = payload.get("category") or payload.get("categories") or payload.get("tags")
+    if isinstance(raw_value, str):
+        candidates.append(raw_value)
+    elif isinstance(raw_value, list):
+        candidates.extend([str(item) for item in raw_value])
+    return [value.strip().lower() for value in candidates if str(value).strip()]
+
+
+def filter_markets(
+    markets: Iterable[GammaMarket],
+    title_filters: Iterable[str],
+    market_filters: Iterable[str],
+    target_market_ids: Iterable[str],
+) -> list[GammaMarket]:
+    title_terms = [term.strip().lower() for term in title_filters if str(term).strip()]
+    category_terms = [term.strip().lower() for term in market_filters if str(term).strip()]
+    target_ids = {str(item) for item in target_market_ids if str(item).strip()}
+
+    filtered: list[GammaMarket] = []
+    for market in markets:
+        if target_ids and market.market_id in target_ids:
+            filtered.append(market)
+            continue
+
+        if title_terms:
+            title_value = market.title.lower()
+            if not any(term in title_value for term in title_terms):
+                continue
+
+        if category_terms:
+            raw = market.raw if isinstance(market.raw, dict) else {}
+            categories = _extract_categories(raw)
+            if not categories or not any(term in categories for term in category_terms):
+                continue
+
+        filtered.append(market)
+    return filtered

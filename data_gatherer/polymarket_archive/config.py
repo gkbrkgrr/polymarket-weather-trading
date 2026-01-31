@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 import orjson
 import yaml
@@ -18,7 +18,10 @@ class Settings(BaseModel):
     data_base_url: str = "https://data-api.polymarket.com"
     clob_base_url: str = "https://clob.polymarket.com"
     clob_ws_url: str = "wss://ws-subscriptions-clob.polymarket.com/ws"
-    title_filter: str = "Highest temperature"
+    title_filter: str | None = "Highest temperature"
+    market_title_contains: list[str] = Field(default_factory=list)
+    market_filters: list[str] = Field(default_factory=list)
+    target_market_ids: list[str] = Field(default_factory=list)
     backfill_start: datetime = Field(
         default_factory=lambda: datetime(2026, 1, 1, tzinfo=timezone.utc)
     )
@@ -34,6 +37,7 @@ class Settings(BaseModel):
     book_snapshot_interval_seconds: int = 5
     rate_limit_per_second: int = 10
     log_level: str = "INFO"
+    snapshot_interval_seconds: int | None = None
 
 
 def _load_file(path: Path) -> dict[str, Any]:
@@ -63,6 +67,25 @@ def _coerce_int(value: Any) -> int:
     return int(str(value))
 
 
+def _coerce_str_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple, set)):
+        return [str(item).strip() for item in value if str(item).strip()]
+    if isinstance(value, str):
+        if not value.strip():
+            return []
+        if value.strip().startswith("["):
+            try:
+                parsed = orjson.loads(value)
+            except orjson.JSONDecodeError:
+                parsed = None
+            if isinstance(parsed, list):
+                return [str(item).strip() for item in parsed if str(item).strip()]
+        return [part.strip() for part in value.split(",") if part.strip()]
+    return [str(value).strip()]
+
+
 def _merge_settings(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
     merged = dict(base)
     for key, value in override.items():
@@ -84,6 +107,11 @@ def load_settings(config_path: str | Path | None = None) -> Settings:
         "clob_base_url": data.get("clob_base_url") or data.get("CLOB_BASE_URL"),
         "clob_ws_url": data.get("clob_ws_url") or data.get("CLOB_WS_URL"),
         "title_filter": data.get("title_filter") or data.get("TITLE_FILTER"),
+        "market_title_contains": data.get("market_title_contains")
+        or data.get("MARKET_TITLE_CONTAINS"),
+        "market_filters": data.get("market_filters") or data.get("MARKET_FILTERS"),
+        "target_market_ids": data.get("target_market_ids")
+        or data.get("TARGET_MARKET_IDS"),
         "backfill_start": data.get("backfill_start") or data.get("BACKFILL_START"),
         "poll_interval_seconds": data.get("poll_interval_seconds")
         or data.get("POLL_INTERVAL_SECONDS"),
@@ -99,6 +127,7 @@ def load_settings(config_path: str | Path | None = None) -> Settings:
         "book_snapshot_interval_seconds": data.get("book_snapshot_interval_seconds"),
         "rate_limit_per_second": data.get("rate_limit_per_second"),
         "log_level": data.get("log_level"),
+        "snapshot_interval_seconds": data.get("snapshot_interval_seconds"),
     }
     file_overrides = {key: value for key, value in file_overrides.items() if value is not None}
 
@@ -116,6 +145,12 @@ def load_settings(config_path: str | Path | None = None) -> Settings:
         env_overrides["clob_ws_url"] = env.get("CLOB_WS_URL")
     if env.get("TITLE_FILTER"):
         env_overrides["title_filter"] = env.get("TITLE_FILTER")
+    if env.get("MARKET_TITLE_CONTAINS"):
+        env_overrides["market_title_contains"] = env.get("MARKET_TITLE_CONTAINS")
+    if env.get("MARKET_FILTERS"):
+        env_overrides["market_filters"] = env.get("MARKET_FILTERS")
+    if env.get("TARGET_MARKET_IDS"):
+        env_overrides["target_market_ids"] = env.get("TARGET_MARKET_IDS")
     if env.get("BACKFILL_START"):
         env_overrides["backfill_start"] = env.get("BACKFILL_START")
     if env.get("POLL_INTERVAL_SECONDS"):
@@ -142,6 +177,8 @@ def load_settings(config_path: str | Path | None = None) -> Settings:
         env_overrides["rate_limit_per_second"] = env.get("RATE_LIMIT_PER_SECOND")
     if env.get("LOG_LEVEL"):
         env_overrides["log_level"] = env.get("LOG_LEVEL")
+    if env.get("SNAPSHOT_INTERVAL_SECONDS"):
+        env_overrides["snapshot_interval_seconds"] = env.get("SNAPSHOT_INTERVAL_SECONDS")
 
     merged = _merge_settings(file_overrides, env_overrides)
 
@@ -149,6 +186,9 @@ def load_settings(config_path: str | Path | None = None) -> Settings:
         merged["raw_dir"] = Path(merged["raw_dir"])
     if merged.get("feature_clob") is not None:
         merged["feature_clob"] = _coerce_bool(merged["feature_clob"])
+    for key in ("market_title_contains", "market_filters", "target_market_ids"):
+        if merged.get(key) is not None:
+            merged[key] = _coerce_str_list(merged.get(key))
     for key in (
         "poll_interval_seconds",
         "discovery_interval_seconds",
@@ -159,6 +199,7 @@ def load_settings(config_path: str | Path | None = None) -> Settings:
         "trades_page_size",
         "book_snapshot_interval_seconds",
         "rate_limit_per_second",
+        "snapshot_interval_seconds",
     ):
         if merged.get(key) is not None:
             merged[key] = _coerce_int(merged[key])
@@ -169,5 +210,8 @@ def load_settings(config_path: str | Path | None = None) -> Settings:
         parsed = parse_datetime(merged["backfill_start"])
         if parsed is not None:
             merged["backfill_start"] = parsed
+
+    if merged.get("snapshot_interval_seconds") is not None:
+        merged["poll_interval_seconds"] = merged["snapshot_interval_seconds"]
 
     return Settings(**merged)
