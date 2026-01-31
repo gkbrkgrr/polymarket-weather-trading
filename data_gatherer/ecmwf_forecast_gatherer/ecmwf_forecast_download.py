@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import shutil
 import sys
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -31,6 +32,12 @@ PRESSURE_LEVELS = (1000, 925, 850, 700)
 SURFACE_PARAMS = ("2t",)
 IFS_PRESSURE_PARAMS = ("t", "gh")
 AIFS_PRESSURE_PARAMS = ("t", "z")
+DEFAULT_WAIT_INTERVAL_SECONDS = 60.0
+DEFAULT_MAX_WAIT_SECONDS = 7200.0
+
+
+class NotReadyError(RuntimeError):
+    pass
 
 
 @dataclass(frozen=True)
@@ -165,12 +172,58 @@ def download_step(
         print(f"Saved: {out_path}")
         return True
     except Exception as exc:
+        message = str(exc).lower()
+        if any(token in message for token in ("not available", "not found", "no data", "404")):
+            raise NotReadyError(str(exc)) from exc
         print(f"Failed: {out_path} ({exc})", file=sys.stderr)
         return False
     finally:
         for tmp_path in tmp_paths:
             tmp_path.unlink(missing_ok=True)
         merged_tmp.unlink(missing_ok=True)
+
+
+def wait_for_step(
+    *,
+    client: Client,
+    requests: list[dict[str, object]],
+    out_path: Path,
+    overwrite: bool,
+    wait_interval: float,
+    max_wait: float,
+    wait_enabled: bool,
+) -> bool:
+    start = time.monotonic()
+    attempts = 0
+    while True:
+        attempts += 1
+        try:
+            return download_step(
+                client=client,
+                requests=requests,
+                out_path=out_path,
+                overwrite=overwrite,
+            )
+        except NotReadyError as exc:
+            if not wait_enabled:
+                print(f"Not ready for {out_path.name}: {exc}", file=sys.stderr)
+                return False
+            elapsed = time.monotonic() - start
+            if elapsed >= max_wait:
+                print(
+                    f"Timed out waiting for {out_path.name} after {elapsed:.0f}s "
+                    f"({attempts} attempts): {exc}",
+                    file=sys.stderr,
+                )
+                return False
+            print(
+                f"Waiting for {out_path.name} (attempt {attempts}): {exc}",
+                file=sys.stderr,
+            )
+            time.sleep(wait_interval)
+        except Exception as exc:
+            print(f"Failed: {out_path} ({exc})", file=sys.stderr)
+            return False
 
 
 def main(argv: list[str]) -> int:
@@ -202,6 +255,32 @@ def main(argv: list[str]) -> int:
         help="ecmwf-opendata source (ecmwf/aws/azure/google)",
     )
     parser.add_argument("--overwrite", action="store_true")
+    wait_group = parser.add_mutually_exclusive_group()
+    wait_group.add_argument(
+        "--wait",
+        dest="wait_enabled",
+        action="store_true",
+        help="Wait for steps to be published (default)",
+    )
+    wait_group.add_argument(
+        "--no-wait",
+        dest="wait_enabled",
+        action="store_false",
+        help="Do not wait for steps to be published",
+    )
+    parser.set_defaults(wait_enabled=True)
+    parser.add_argument(
+        "--wait-interval-seconds",
+        type=float,
+        default=DEFAULT_WAIT_INTERVAL_SECONDS,
+        help="Seconds between availability checks (default: 60)",
+    )
+    parser.add_argument(
+        "--max-wait-seconds",
+        type=float,
+        default=DEFAULT_MAX_WAIT_SECONDS,
+        help="Maximum seconds to wait per step (default: 7200)",
+    )
 
     args = parser.parse_args(argv)
 
@@ -238,11 +317,14 @@ def main(argv: list[str]) -> int:
                 stream=stream,
                 pressure_params=config.pressure_params,
             )
-            ok = download_step(
+            ok = wait_for_step(
                 client=client,
                 requests=reqs,
                 out_path=out_path,
                 overwrite=args.overwrite,
+                wait_interval=args.wait_interval_seconds,
+                max_wait=args.max_wait_seconds,
+                wait_enabled=args.wait_enabled,
             )
             if not ok:
                 failures += 1

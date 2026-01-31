@@ -15,10 +15,11 @@ import urllib.parse
 import urllib.request
 import urllib.error
 from typing import Any, Iterable, Optional
+from zoneinfo import ZoneInfo
 
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-_REPO_ROOT = os.path.abspath(os.path.join(_SCRIPT_DIR, os.pardir))
+_REPO_ROOT = os.path.abspath(os.path.join(_SCRIPT_DIR, os.pardir, os.pardir))
 
 
 DEFAULT_LOCATIONS_CSV = os.path.join(_REPO_ROOT, "locations.csv")
@@ -26,7 +27,7 @@ DEFAULT_OUTPUT_DIR = os.path.join(_REPO_ROOT, "data", "observations")
 DEFAULT_UNITS = "e"  # English/Imperial units from weather.com APIs (temp=F, precip=in)
 DEFAULT_CHUNK_DAYS = 30
 DEFAULT_BOOTSTRAP_DAYS = 30
-DEFAULT_OUTPUT_FORMAT = "jsonl"  # jsonl|parquet
+DEFAULT_OUTPUT_FORMAT = "parquet"  # parquet|jsonl
 DEFAULT_RETRIES = 3
 DEFAULT_RETRY_BACKOFF_S = 1.0
 
@@ -157,6 +158,13 @@ def extract_weather_com_api_key(wunderground_html: str) -> str:
     raise RuntimeError("Could not find weather.com apiKey in Wunderground HTML")
 
 
+def extract_iana_timezone(wunderground_html: str) -> str:
+    tz_match = re.search(r'ianaTimeZone"\s*:\s*"([^"]+)"', wunderground_html)
+    if tz_match:
+        return tz_match.group(1)
+    raise RuntimeError("Could not find ianaTimeZone in Wunderground HTML")
+
+
 @dataclasses.dataclass(frozen=True)
 class Station:
     name: str
@@ -268,6 +276,41 @@ def _epoch_s_to_utc_dt(epoch_s: int) -> dt.datetime:
     return dt.datetime.fromtimestamp(epoch_s, tz=dt.timezone.utc)
 
 
+def _parse_observed_at_local(value: str) -> Optional[dt.datetime]:
+    value = value.strip()
+    if not value:
+        return None
+    try:
+        return dt.datetime.fromisoformat(value)
+    except ValueError:
+        return None
+
+
+def _extract_observed_at_local(record: dict[str, Any]) -> Optional[str]:
+    value = record.get("observed_at_local") or record.get("obs_time_local") or record.get("valid_time_local")
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    valid_time_gmt = record.get("valid_time_gmt")
+    if isinstance(valid_time_gmt, int):
+        return _epoch_s_to_utc_dt(valid_time_gmt).isoformat()
+    return None
+
+
+def _normalize_record(record: dict[str, Any]) -> Optional[dict[str, Any]]:
+    observed_at_local = _extract_observed_at_local(record)
+    if observed_at_local is None:
+        return None
+    normalized = dict(record)
+    normalized["observed_at_local"] = observed_at_local
+    normalized.pop("valid_time_gmt", None)
+    normalized.pop("observed_at_utc", None)
+    normalized.pop("wunderground_url", None)
+    normalized.pop("weather_com_location_id", None)
+    normalized.pop("obs_time_local", None)
+    normalized.pop("valid_time_local", None)
+    return normalized
+
+
 def _round_half_away_from_zero(value: float) -> int:
     return int(math.floor(value + 0.5)) if value >= 0 else int(math.ceil(value - 0.5))
 
@@ -276,6 +319,7 @@ def observations_to_records(
     *,
     station: Station,
     observations: list[dict[str, Any]],
+    tzinfo: dt.tzinfo,
     scraped_at_utc: dt.datetime,
     include_precip: bool,
 ) -> list[dict[str, Any]]:
@@ -284,6 +328,7 @@ def observations_to_records(
         valid_time_gmt = obs.get("valid_time_gmt")
         if not isinstance(valid_time_gmt, int):
             continue
+        local_dt = dt.datetime.fromtimestamp(valid_time_gmt, tz=dt.timezone.utc).astimezone(tzinfo)
 
         temp_f = _to_float(obs.get("temp"))
         if temp_f is None:
@@ -294,10 +339,7 @@ def observations_to_records(
 
         record: dict[str, Any] = {
             "station": station.name,
-            "wunderground_url": station.url,
-            "weather_com_location_id": station.weather_com_location_id,
-            "valid_time_gmt": valid_time_gmt,
-            "observed_at_utc": _epoch_s_to_utc_dt(valid_time_gmt).isoformat(),
+            "observed_at_local": local_dt.isoformat(),
             "temperature_f": temp_f_int,
             "temperature_c": temp_c_int,
             "scraped_at_utc": scraped_at_utc.isoformat(),
@@ -381,20 +423,22 @@ def upsert_station_records(*, output_path: str, new_records: list[dict[str, Any]
     _require_pyarrow()
     existing_records = load_existing_parquet_records(output_path) or []
 
-    by_time: dict[int, dict[str, Any]] = {}
+    by_time: dict[str, dict[str, Any]] = {}
     for record in existing_records:
-        value = record.get("valid_time_gmt")
-        if isinstance(value, int):
-            by_time[value] = record
+        normalized = _normalize_record(record)
+        if normalized is None:
+            continue
+        by_time[normalized["observed_at_local"]] = normalized
 
     inserted = 0
     for record in new_records:
-        value = record.get("valid_time_gmt")
-        if not isinstance(value, int):
+        normalized = _normalize_record(record)
+        if normalized is None:
             continue
-        if value not in by_time:
+        key = normalized["observed_at_local"]
+        if key not in by_time:
             inserted += 1
-        by_time[value] = record
+        by_time[key] = normalized
 
     combined = [by_time[k] for k in sorted(by_time.keys())]
     write_parquet_records(combined, output_path)
@@ -406,20 +450,22 @@ def upsert_station_records_jsonl(*, output_path: str, new_records: list[dict[str
         return 0
 
     existing_records = _read_existing_jsonl_records(output_path)
-    by_time: dict[int, dict[str, Any]] = {}
+    by_time: dict[str, dict[str, Any]] = {}
     for record in existing_records:
-        value = record.get("valid_time_gmt")
-        if isinstance(value, int):
-            by_time[value] = record
+        normalized = _normalize_record(record)
+        if normalized is None:
+            continue
+        by_time[normalized["observed_at_local"]] = normalized
 
     inserted = 0
     for record in new_records:
-        value = record.get("valid_time_gmt")
-        if not isinstance(value, int):
+        normalized = _normalize_record(record)
+        if normalized is None:
             continue
-        if value not in by_time:
+        key = normalized["observed_at_local"]
+        if key not in by_time:
             inserted += 1
-        by_time[value] = record
+        by_time[key] = normalized
 
     combined = [by_time[k] for k in sorted(by_time.keys())]
     _write_jsonl_records(combined, output_path)
@@ -431,20 +477,25 @@ def _infer_station_output_path(output_dir: str, station: Station) -> str:
     return os.path.join(output_dir, f"{safe_name}")
 
 
-def _latest_observed_time_gmt_parquet(output_path: str) -> Optional[int]:
+def _latest_observed_date_local_parquet(output_path: str) -> Optional[dt.date]:
     existing = load_existing_parquet_records(output_path)
     if not existing:
         return None
-    latest: Optional[int] = None
+    latest: Optional[dt.date] = None
     for record in existing:
-        value = record.get("valid_time_gmt")
-        if isinstance(value, int):
-            latest = value if latest is None else max(latest, value)
+        observed_at_local = _extract_observed_at_local(record)
+        if observed_at_local is None:
+            continue
+        parsed = _parse_observed_at_local(observed_at_local)
+        if parsed is None:
+            continue
+        observed_date = parsed.date()
+        latest = observed_date if latest is None else max(latest, observed_date)
     return latest
 
 
-def _latest_observed_time_gmt_jsonl(output_path: str) -> Optional[int]:
-    latest: Optional[int] = None
+def _latest_observed_date_local_jsonl(output_path: str) -> Optional[dt.date]:
+    latest: Optional[dt.date] = None
     if not os.path.exists(output_path):
         return None
     with open(output_path, "r", encoding="utf-8") as f:
@@ -458,9 +509,14 @@ def _latest_observed_time_gmt_jsonl(output_path: str) -> Optional[int]:
                 continue
             if not isinstance(record, dict):
                 continue
-            value = record.get("valid_time_gmt")
-            if isinstance(value, int):
-                latest = value if latest is None else max(latest, value)
+            observed_at_local = _extract_observed_at_local(record)
+            if observed_at_local is None:
+                continue
+            parsed = _parse_observed_at_local(observed_at_local)
+            if parsed is None:
+                continue
+            observed_date = parsed.date()
+            latest = observed_date if latest is None else max(latest, observed_date)
     return latest
 
 
@@ -498,14 +554,14 @@ def scrape_once(
                     latest = None
                 else:
                     latest = (
-                        _latest_observed_time_gmt_parquet(output_path)
+                        _latest_observed_date_local_parquet(output_path)
                         if output_format == "parquet"
-                        else _latest_observed_time_gmt_jsonl(output_path)
+                        else _latest_observed_date_local_jsonl(output_path)
                     )
                 if latest is None:
                     station_start = end_date - dt.timedelta(days=DEFAULT_BOOTSTRAP_DAYS)
                 else:
-                    station_start = _epoch_s_to_utc_dt(latest).date() - dt.timedelta(days=1)
+                    station_start = latest - dt.timedelta(days=1)
             else:
                 station_start = start_date
 
@@ -518,6 +574,14 @@ def scrape_once(
                 retry_backoff_s=retry_backoff_s,
             )
             api_key = extract_weather_com_api_key(html)
+            try:
+                tzinfo = ZoneInfo(extract_iana_timezone(html))
+            except Exception as exc:
+                _log(
+                    f"{station.name}: failed to extract timezone ({type(exc).__name__}: {exc}); "
+                    "falling back to UTC"
+                )
+                tzinfo = dt.timezone.utc
 
             scraped_at = _utcnow()
             total_new = 0
@@ -545,6 +609,7 @@ def scrape_once(
                 records = observations_to_records(
                     station=station,
                     observations=observations,
+                    tzinfo=tzinfo,
                     scraped_at_utc=scraped_at,
                     include_precip=include_precip,
                 )
@@ -559,7 +624,7 @@ def scrape_once(
                 _sleep_seconds(throttle_s)
 
             if dry_run:
-                unique = {r.get("valid_time_gmt") for r in buffered if isinstance(r.get("valid_time_gmt"), int)}
+                unique = {r.get("observed_at_local") for r in buffered if isinstance(r.get("observed_at_local"), str)}
                 sample = buffered[-1] if buffered else None
                 print(f"{station.name}: scraped {len(unique)} unique timestamps (dry-run). sample={sample}")
             else:
@@ -588,7 +653,7 @@ def main() -> int:
     parser.add_argument(
         "--end-date",
         type=_parse_yyyy_mm_dd,
-        default=dt.date.today(),
+        default=None,
         help="Backfill end date (YYYY-MM-DD), default: today",
     )
     parser.add_argument("--chunk-days", type=int, default=DEFAULT_CHUNK_DAYS, help="Days per API request chunk")
@@ -598,7 +663,7 @@ def main() -> int:
     parser.add_argument(
         "--format",
         default=DEFAULT_OUTPUT_FORMAT,
-        help="Output format: jsonl (default) or parquet (requires working pyarrow)",
+        help="Output format: parquet (default, requires working pyarrow) or jsonl",
     )
     parser.add_argument("--retries", type=int, default=DEFAULT_RETRIES, help="HTTP retry attempts on timeouts/5xx")
     parser.add_argument(
@@ -624,6 +689,14 @@ def main() -> int:
         default=0.0,
         help="If set (>0), run forever and rescrape every N minutes (e.g. 30).",
     )
+    parser.add_argument(
+        "--live-after-backfill",
+        action="store_true",
+        help=(
+            "If set with --start-date, run the backfill once, then keep looping without --start-date "
+            "(incremental live updates). Requires --loop-minutes > 0."
+        ),
+    )
     args = parser.parse_args()
 
     stations = load_stations(args.locations)
@@ -633,12 +706,14 @@ def main() -> int:
     if not stations:
         raise RuntimeError("No stations selected")
 
+    start_date_for_loop = args.start_date
     while True:
+        end_date = args.end_date or dt.date.today()
         scrape_once(
             stations=stations,
             output_dir=args.output_dir,
-            start_date=args.start_date,
-            end_date=args.end_date,
+            start_date=start_date_for_loop,
+            end_date=end_date,
             chunk_days=args.chunk_days,
             throttle_s=args.throttle_s,
             timeout_s=args.timeout_s,
@@ -649,6 +724,8 @@ def main() -> int:
             fail_fast=args.fail_fast,
         )
         if args.loop_minutes and args.loop_minutes > 0:
+            if args.live_after_backfill and start_date_for_loop is not None:
+                start_date_for_loop = None
             _sleep_seconds(args.loop_minutes * 60.0)
         else:
             break

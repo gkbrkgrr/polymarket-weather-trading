@@ -18,6 +18,7 @@ import csv
 import re
 import shutil
 import sys
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -32,6 +33,12 @@ SURFACE_LEVELS = ("2_m_above_ground",)
 PRESSURE_LEVELS = ("1000_mb", "925_mb", "850_mb", "700_mb")
 VARIABLES = ("TMP", "HGT")
 DEFAULT_BUFFER_DEG = 1.0
+DEFAULT_WAIT_INTERVAL_SECONDS = 60.0
+DEFAULT_MAX_WAIT_SECONDS = 7200.0
+
+
+class NotReadyError(RuntimeError):
+    pass
 
 
 @dataclass(frozen=True)
@@ -190,11 +197,66 @@ def download_step(
             with open(tmp_path, "wb") as f:
                 shutil.copyfileobj(resp, f)
         if tmp_path.stat().st_size == 0:
-            raise RuntimeError("Downloaded file is empty")
+            raise NotReadyError("Downloaded file is empty")
         tmp_path.replace(out_path)
         print(f"Saved: {out_path}")
+    except HTTPError as exc:
+        if exc.code in {403, 404, 500, 502, 503, 504}:
+            raise NotReadyError(f"HTTP {exc.code} for {url}") from exc
+        raise
+    except URLError as exc:
+        raise NotReadyError(f"Network error for {url}: {exc}") from exc
     finally:
         tmp_path.unlink(missing_ok=True)
+
+
+def wait_for_step(
+    *,
+    req: GFSRequest,
+    out_path: Path,
+    area: tuple[float, float, float, float],
+    overwrite: bool,
+    timeout: float,
+    wait_interval: float,
+    max_wait: float,
+    wait_enabled: bool,
+) -> bool:
+    start = time.monotonic()
+    attempts = 0
+    while True:
+        attempts += 1
+        try:
+            download_step(
+                req=req,
+                out_path=out_path,
+                area=area,
+                overwrite=overwrite,
+                timeout=timeout,
+            )
+            return True
+        except NotReadyError as exc:
+            if not wait_enabled:
+                print(f"Not ready for step {req.step_str}: {exc}", file=sys.stderr)
+                return False
+            elapsed = time.monotonic() - start
+            if elapsed >= max_wait:
+                print(
+                    f"Timed out waiting for step {req.step_str} after {elapsed:.0f}s "
+                    f"({attempts} attempts): {exc}",
+                    file=sys.stderr,
+                )
+                return False
+            print(
+                f"Waiting for step {req.step_str} (attempt {attempts}): {exc}",
+                file=sys.stderr,
+            )
+            time.sleep(wait_interval)
+        except (HTTPError, URLError, RuntimeError) as exc:
+            print(f"Failed step {req.step_str}: {exc}", file=sys.stderr)
+            return False
+        except Exception as exc:
+            print(f"Failed step {req.step_str}: {exc}", file=sys.stderr)
+            return False
 
 
 def main(argv: list[str]) -> int:
@@ -218,6 +280,32 @@ def main(argv: list[str]) -> int:
     )
     p.add_argument("--buffer-deg", type=float, default=DEFAULT_BUFFER_DEG)
     p.add_argument("--timeout", type=float, default=120.0)
+    wait_group = p.add_mutually_exclusive_group()
+    wait_group.add_argument(
+        "--wait",
+        dest="wait_enabled",
+        action="store_true",
+        help="Wait for steps to be published (default)",
+    )
+    wait_group.add_argument(
+        "--no-wait",
+        dest="wait_enabled",
+        action="store_false",
+        help="Do not wait for steps to be published",
+    )
+    p.set_defaults(wait_enabled=True)
+    p.add_argument(
+        "--wait-interval-seconds",
+        type=float,
+        default=DEFAULT_WAIT_INTERVAL_SECONDS,
+        help="Seconds between availability checks (default: 60)",
+    )
+    p.add_argument(
+        "--max-wait-seconds",
+        type=float,
+        default=DEFAULT_MAX_WAIT_SECONDS,
+        help="Maximum seconds to wait per step (default: 7200)",
+    )
 
     args = p.parse_args(argv)
 
@@ -251,18 +339,18 @@ def main(argv: list[str]) -> int:
     for step in steps:
         req = GFSRequest(cycle=cycle, step_hours=step)
         out_path = cycle_root / req.filename
-        try:
-            download_step(
-                req=req,
-                out_path=out_path,
-                area=area,
-                overwrite=args.overwrite,
-                timeout=args.timeout,
-            )
-        except (HTTPError, URLError, RuntimeError) as exc:
-            print(f"Failed step {step:03d}: {exc}", file=sys.stderr)
-        except Exception as exc:
-            print(f"Failed step {step:03d}: {exc}", file=sys.stderr)
+        ok = wait_for_step(
+            req=req,
+            out_path=out_path,
+            area=area,
+            overwrite=args.overwrite,
+            timeout=args.timeout,
+            wait_interval=args.wait_interval_seconds,
+            max_wait=args.max_wait_seconds,
+            wait_enabled=args.wait_enabled,
+        )
+        if not ok:
+            print(f"Failed step {step:03d}", file=sys.stderr)
 
     return 0
 

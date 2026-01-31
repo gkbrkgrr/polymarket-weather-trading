@@ -10,8 +10,8 @@ Defaults are computed relative to the repo root, so you can run the script from 
 
 ### Output format
 
-- Default: `jsonl` (no extra dependencies, works in constrained environments).
-- Optional: `parquet` (requires a working `pyarrow` installation).
+- Default: `parquet` (requires a working `pyarrow` installation).
+- Optional: `jsonl` (no extra dependencies, works in constrained environments).
 
 ### Parquet dependency
 
@@ -25,10 +25,10 @@ python -m pip install "pyarrow>=14"
 python data_gatherer/observations_scraper.py --start-date 2026-01-01
 ```
 
-To force parquet output:
+To force jsonl output:
 
 ```bash
-python data_gatherer/observations_scraper.py --start-date 2026-01-01 --format parquet
+python data_gatherer/observations_scraper.py --start-date 2026-01-01 --format jsonl
 ```
 
 ### Incremental updates (run every 30 minutes)
