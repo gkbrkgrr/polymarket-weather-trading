@@ -172,13 +172,20 @@ class Station:
     lat_lon: str
     country_code: str
     station_code: str
+    timezone: Optional[str] = None
 
     @property
     def weather_com_location_id(self) -> str:
         return f"{self.station_code}:9:{self.country_code}"
 
 
-def parse_station_from_wunderground_url(*, name: str, url: str, lat_lon: str) -> Station:
+def parse_station_from_wunderground_url(
+    *,
+    name: str,
+    url: str,
+    lat_lon: str,
+    timezone: Optional[str] = None,
+) -> Station:
     parsed = urllib.parse.urlparse(url)
     parts = [p for p in parsed.path.split("/") if p]
     try:
@@ -194,7 +201,15 @@ def parse_station_from_wunderground_url(*, name: str, url: str, lat_lon: str) ->
     if not re.fullmatch(r"[A-Z0-9]{3,6}", station_code):
         raise ValueError(f"Unexpected station code in URL ({station_code!r}): {url}")
 
-    return Station(name=name, url=url, lat_lon=lat_lon, country_code=country, station_code=station_code)
+    timezone = timezone.strip() if isinstance(timezone, str) and timezone.strip() else None
+    return Station(
+        name=name,
+        url=url,
+        lat_lon=lat_lon,
+        country_code=country,
+        station_code=station_code,
+        timezone=timezone,
+    )
 
 
 def load_stations(locations_csv_path: str) -> list[Station]:
@@ -205,9 +220,12 @@ def load_stations(locations_csv_path: str) -> list[Station]:
             name = (row.get("name") or "").strip()
             url = (row.get("url") or "").strip()
             lat_lon = (row.get("lat_lon") or "").strip()
+            timezone = (row.get("timezone") or "").strip()
             if not name or not url:
                 continue
-            stations.append(parse_station_from_wunderground_url(name=name, url=url, lat_lon=lat_lon))
+            stations.append(
+                parse_station_from_wunderground_url(name=name, url=url, lat_lon=lat_lon, timezone=timezone)
+            )
     if not stations:
         raise RuntimeError(f"No stations found in {locations_csv_path}")
     return stations
@@ -574,14 +592,43 @@ def scrape_once(
                 retry_backoff_s=retry_backoff_s,
             )
             api_key = extract_weather_com_api_key(html)
+            tzinfo: dt.tzinfo | None = None
+            wu_timezone: Optional[str] = None
+            if station.timezone:
+                try:
+                    tzinfo = ZoneInfo(station.timezone)
+                except Exception as exc:
+                    _log(
+                        f"{station.name}: invalid locations.csv timezone {station.timezone!r} "
+                        f"({type(exc).__name__}: {exc}); falling back to Wunderground"
+                    )
+                    tzinfo = None
             try:
-                tzinfo = ZoneInfo(extract_iana_timezone(html))
+                wu_timezone = extract_iana_timezone(html)
             except Exception as exc:
+                wu_timezone = None
                 _log(
-                    f"{station.name}: failed to extract timezone ({type(exc).__name__}: {exc}); "
-                    "falling back to UTC"
+                    f"{station.name}: failed to extract Wunderground timezone "
+                    f"({type(exc).__name__}: {exc})"
                 )
-                tzinfo = dt.timezone.utc
+            if tzinfo is None:
+                if wu_timezone:
+                    try:
+                        tzinfo = ZoneInfo(wu_timezone)
+                    except Exception as exc:
+                        _log(
+                            f"{station.name}: invalid Wunderground timezone {wu_timezone!r} "
+                            f"({type(exc).__name__}: {exc}); falling back to UTC"
+                        )
+                        tzinfo = dt.timezone.utc
+                else:
+                    _log(f"{station.name}: no timezone available; falling back to UTC")
+                    tzinfo = dt.timezone.utc
+            if station.timezone and wu_timezone and station.timezone != wu_timezone:
+                _log(
+                    f"{station.name}: timezone mismatch locations.csv={station.timezone!r} "
+                    f"Wunderground={wu_timezone!r}; using locations.csv"
+                )
 
             scraped_at = _utcnow()
             total_new = 0
