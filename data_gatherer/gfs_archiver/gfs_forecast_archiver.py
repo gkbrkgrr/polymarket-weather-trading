@@ -8,8 +8,8 @@ Defaults:
 - 2m relative humidity (rh2m)
 - 10m winds (u10/v10)
 - total cloud cover (tcc)
-- temperature at 1000/925/850/700 hPa
-- geopotential height at 1000/925/850/700 hPa
+- total precipitation (apcp)
+- surface solar radiation downwards (ssrd/dswrf)
 
 Files are saved as:
   gfs_<yyyymmddhh>_f<fff>.grib2
@@ -44,9 +44,9 @@ SURFACE_PATTERNS = (
     "UGRD:10 m above ground",
     "VGRD:10 m above ground",
     "TCDC:entire atmosphere",
+    "APCP:surface",
+    "DSWRF:surface",
 )
-PRESSURE_LEVELS = (1000, 925, 850, 700)
-
 
 class DownloadError(RuntimeError):
     def __init__(self, message: str, *, status_code: Optional[int] = None) -> None:
@@ -165,10 +165,6 @@ def iter_steps(explicit: Optional[Iterable[int]], max_step: int, interval: int) 
 
 def build_match_regex() -> str:
     parts = list(SURFACE_PATTERNS)
-    for level in PRESSURE_LEVELS:
-        parts.append(f"TMP:{level} mb")
-    for level in PRESSURE_LEVELS:
-        parts.append(f"HGT:{level} mb")
     joined = "|".join(re.escape(p) for p in parts)
     return rf":({joined}):"
 
@@ -320,6 +316,88 @@ def subset_with_wgrib2(
     tmp_out.replace(output_path)
 
 
+def _inventory_lines(wgrib2_bin: str, input_path: Path, *, verbose: bool) -> list[str]:
+    cmd = [wgrib2_bin, str(input_path), "-s"]
+    stderr = None if verbose else subprocess.PIPE
+    try:
+        result = subprocess.run(
+            cmd,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=stderr,
+            text=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        if exc.stderr:
+            raise RuntimeError(exc.stderr.strip()) from exc
+        raise
+    return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+
+
+def _dedupe_inventory_lines(lines: list[str]) -> tuple[list[str], bool]:
+    seen: set[str] = set()
+    kept: list[str] = []
+    for line in lines:
+        parts = line.split(":", 2)
+        if len(parts) < 3:
+            kept.append(line)
+            continue
+        key = parts[2]
+        if key in seen:
+            continue
+        seen.add(key)
+        kept.append(line)
+    return kept, len(kept) < len(lines)
+
+
+def dedupe_grib_records(
+    *,
+    wgrib2_bin: str,
+    input_path: Path,
+    verbose: bool,
+) -> None:
+    lines = _inventory_lines(wgrib2_bin, input_path, verbose=verbose)
+    kept, changed = _dedupe_inventory_lines(lines)
+    if not changed:
+        return
+
+    tmp_out = input_path.with_suffix(input_path.suffix + ".dedupe.part")
+    if tmp_out.exists():
+        tmp_out.unlink()
+
+    cmd = [
+        wgrib2_bin,
+        str(input_path),
+        "-set_grib_type",
+        "same",
+        "-i",
+        "-grib",
+        str(tmp_out),
+    ]
+    stdin_data = "\n".join(kept) + "\n"
+    stderr = None if verbose else subprocess.PIPE
+
+    try:
+        subprocess.run(
+            cmd,
+            check=True,
+            input=stdin_data,
+            stdout=subprocess.DEVNULL,
+            stderr=stderr,
+            text=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        if exc.stderr:
+            raise RuntimeError(exc.stderr.strip()) from exc
+        raise
+
+    if not tmp_out.exists() or tmp_out.stat().st_size == 0:
+        tmp_out.unlink(missing_ok=True)
+        raise RuntimeError("wgrib2 dedupe produced empty output")
+
+    tmp_out.replace(input_path)
+
+
 def main(argv: list[str]) -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--cycle", required=True, help="UTC cycle in YYYYMMDDHH format")
@@ -427,6 +505,11 @@ def main(argv: list[str]) -> int:
                 output_path=out_path,
                 bbox=bbox,
                 match_regex=match_regex,
+                verbose=args.verbose,
+            )
+            dedupe_grib_records(
+                wgrib2_bin=wgrib2_path,
+                input_path=out_path,
                 verbose=args.verbose,
             )
             print(f"Saved: {out_path}")
