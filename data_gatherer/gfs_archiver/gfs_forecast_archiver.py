@@ -24,6 +24,8 @@ import shutil
 import subprocess
 import sys
 import time
+import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -31,11 +33,21 @@ from typing import Iterable, Optional
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+# --- TQDM CHECK ---
+try:
+    from tqdm import tqdm
+    TQDM_AVAILABLE = True
+except ImportError:
+    TQDM_AVAILABLE = False
+    print("WARNING: 'tqdm' library not found. For progress bars run: pip install tqdm")
+
+# --- CONSTANTS ---
 DEFAULT_BUCKET = "noaa-gfs-bdp-pds"
 DEFAULT_BUFFER_DEG = 1.5
 DEFAULT_TIMEOUT_SECONDS = 120.0
 DEFAULT_RETRIES = 3
 DEFAULT_RETRY_DELAY_SECONDS = 15.0
+DEFAULT_THREADS = 33
 
 SURFACE_PATTERNS = (
     "TMP:2 m above ground",
@@ -48,11 +60,25 @@ SURFACE_PATTERNS = (
     "DSWRF:surface",
 )
 
+# --- SSL FIX ---
+def apply_ssl_fix():
+    paths = [
+        "/etc/ssl/certs/ca-certificates.crt",
+        "/etc/pki/tls/certs/ca-bundle.crt",
+        "/etc/ssl/ca-bundle.pem",
+    ]
+    for path in paths:
+        if os.path.exists(path):
+            os.environ['SSL_CERT_FILE'] = path
+            os.environ['REQUESTS_CA_BUNDLE'] = path
+            break
+
+apply_ssl_fix()
+
 class DownloadError(RuntimeError):
     def __init__(self, message: str, *, status_code: Optional[int] = None) -> None:
         super().__init__(message)
         self.status_code = status_code
-
 
 @dataclass(frozen=True)
 class GFSRequest:
@@ -80,17 +106,14 @@ class GFSRequest:
             f"{base}/{name}",
         )
 
-
 def parse_cycle(cycle_str: str) -> datetime:
     try:
         return datetime.strptime(cycle_str, "%Y%m%d%H")
     except ValueError as exc:
         raise ValueError("cycle must be in YYYYMMDDHH format") from exc
 
-
 def default_output_root() -> Path:
     return Path(__file__).resolve().parents[2] / "data" / "raster_data" / "gfs_archive"
-
 
 def _parse_lat_lon(value: str) -> tuple[float, float]:
     match = re.fullmatch(r"\s*([0-9.]+)\s*([NS])\s*([0-9.]+)\s*([EW])\s*", value)
@@ -99,7 +122,6 @@ def _parse_lat_lon(value: str) -> tuple[float, float]:
     lat = float(match.group(1)) * (1 if match.group(2) == "N" else -1)
     lon = float(match.group(3)) * (1 if match.group(4) == "E" else -1)
     return lat, lon
-
 
 def parse_area(area: Optional[str]) -> Optional[tuple[float, float, float, float]]:
     if not area:
@@ -114,12 +136,7 @@ def parse_area(area: Optional[str]) -> Optional[tuple[float, float, float, float
         raise ValueError("area west must be <= east")
     return top, left, bottom, right
 
-
-def default_area_from_locations(
-    locations_csv: Path,
-    *,
-    buffer_deg: float,
-) -> tuple[float, float, float, float]:
+def default_area_from_locations(locations_csv: Path, *, buffer_deg: float) -> tuple[float, float, float, float]:
     if not locations_csv.exists():
         raise FileNotFoundError(f"locations.csv not found at {locations_csv}")
 
@@ -150,7 +167,6 @@ def default_area_from_locations(
 
     return lat_max, lon_min, lat_min, lon_max
 
-
 def iter_steps(explicit: Optional[Iterable[int]], max_step: int, interval: int) -> list[int]:
     if explicit:
         steps = sorted({int(s) for s in explicit})
@@ -162,34 +178,26 @@ def iter_steps(explicit: Optional[Iterable[int]], max_step: int, interval: int) 
         steps = list(range(0, max_step + 1, interval))
     return steps
 
-
 def build_match_regex() -> str:
     parts = list(SURFACE_PATTERNS)
     joined = "|".join(re.escape(p) for p in parts)
     return rf":({joined}):"
 
-
 def wgrib2_bbox(area: tuple[float, float, float, float]) -> tuple[float, float, float, float]:
     north, west, south, east = area
-    lat_s = south
-    lat_n = north
-    lon_w = west
-    lon_e = east
-    if lat_s > lat_n:
+    if south > north:
         raise ValueError("Area south must be <= north")
-    if lon_e == lon_w:
+    if east == west:
         raise ValueError("Area west/east span is zero")
-    if lon_e < lon_w:
-        lon_e += 360.0
-    return lon_w, lon_e, lat_s, lat_n
-
+    if east < west:
+        east += 360.0
+    return west, east, south, north
 
 def ensure_wgrib2(wgrib2_bin: str) -> str:
     resolved = shutil.which(wgrib2_bin)
     if not resolved:
         raise FileNotFoundError(f"wgrib2 not found on PATH: {wgrib2_bin}")
     return resolved
-
 
 def download_to_path(
     *,
@@ -199,15 +207,17 @@ def download_to_path(
     retries: int,
     retry_delay: float,
     user_agent: str,
+    step_info: str,
+    thread_pos: int  # TQDM position
 ) -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = out_path.with_suffix(out_path.suffix + ".part")
-
     if tmp_path.exists():
         tmp_path.unlink()
 
     request = Request(url, headers={"User-Agent": user_agent})
     attempt = 0
+    
     while True:
         attempt += 1
         try:
@@ -215,28 +225,46 @@ def download_to_path(
                 status = getattr(resp, "status", None) or resp.getcode()
                 if status != 200:
                     raise DownloadError(f"HTTP {status} for {url}", status_code=status)
-                with open(tmp_path, "wb") as f:
-                    shutil.copyfileobj(resp, f)
+                
+                total_size = int(resp.getheader('Content-Length', 0))
+                block_size = 1024 * 64  # 64KB chunks
+                
+                if TQDM_AVAILABLE:
+                    # Using tqdm for progress bars
+                    with tqdm(
+                        total=total_size, 
+                        unit='B', 
+                        unit_scale=True, 
+                        unit_divisor=1024, 
+                        desc=f"[{step_info}]", 
+                        leave=False,
+                        position=thread_pos 
+                    ) as pbar:
+                        with open(tmp_path, "wb") as f:
+                            while True:
+                                buffer = resp.read(block_size)
+                                if not buffer:
+                                    break
+                                f.write(buffer)
+                                pbar.update(len(buffer))
+                else:
+                    # Fallback if tqdm is missing
+                    with open(tmp_path, "wb") as f:
+                        shutil.copyfileobj(resp, f)
+            
             if tmp_path.stat().st_size == 0:
                 raise DownloadError("Downloaded file is empty")
             tmp_path.replace(out_path)
             return
-        except HTTPError as exc:
-            if attempt > retries:
-                tmp_path.unlink(missing_ok=True)
-                raise DownloadError(
-                    f"HTTP {exc.code} for {url}",
-                    status_code=exc.code,
-                ) from exc
-            time.sleep(retry_delay)
-        except (URLError, DownloadError) as exc:
-            if attempt > retries:
-                tmp_path.unlink(missing_ok=True)
-                raise DownloadError(str(exc)) from exc
-            time.sleep(retry_delay)
-        finally:
-            tmp_path.unlink(missing_ok=True)
 
+        except (HTTPError, URLError, DownloadError) as exc:
+            if attempt > retries:
+                tmp_path.unlink(missing_ok=True)
+                raise DownloadError(f"Failed after {retries} retries: {exc}") from exc
+            
+            if not TQDM_AVAILABLE:
+                print(f"[{step_info}] Retry {attempt}/{retries} for {url} ({exc})")
+            time.sleep(retry_delay)
 
 def download_with_fallback(
     *,
@@ -246,11 +274,11 @@ def download_with_fallback(
     retries: int,
     retry_delay: float,
     user_agent: str,
+    step_info: str,
+    thread_pos: int
 ) -> str:
     last_error: Optional[DownloadError] = None
     urls_list = list(urls)
-    if not urls_list:
-        raise DownloadError("No candidate URLs provided")
     for idx, url in enumerate(urls_list):
         try:
             download_to_path(
@@ -260,15 +288,15 @@ def download_with_fallback(
                 retries=retries,
                 retry_delay=retry_delay,
                 user_agent=user_agent,
+                step_info=step_info,
+                thread_pos=thread_pos
             )
             return url
         except DownloadError as exc:
             last_error = exc
-            if exc.status_code == 404 and idx < len(urls_list) - 1:
+            if hasattr(exc, 'status_code') and exc.status_code == 404 and idx < len(urls_list) - 1:
                 continue
-            raise
     raise last_error or DownloadError("All candidate URLs failed")
-
 
 def subset_with_wgrib2(
     *,
@@ -277,248 +305,158 @@ def subset_with_wgrib2(
     output_path: Path,
     bbox: tuple[float, float, float, float],
     match_regex: str,
-    verbose: bool,
 ) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     tmp_out = output_path.with_suffix(output_path.suffix + ".part")
-    lon_w, lon_e, lat_s, lat_n = bbox
-
     if tmp_out.exists():
         tmp_out.unlink()
-
+    
+    lon_w, lon_e, lat_s, lat_n = bbox
+    
     cmd = [
-        wgrib2_bin,
-        str(input_path),
-        "-match",
-        match_regex,
-        "-set_grib_type",
-        "same",
-        "-small_grib",
-        f"{lon_w}:{lon_e}",
-        f"{lat_s}:{lat_n}",
+        wgrib2_bin, str(input_path),
+        "-match", match_regex,
+        "-set_grib_type", "same",
+        "-small_grib", f"{lon_w}:{lon_e}", f"{lat_s}:{lat_n}",
         str(tmp_out),
     ]
 
-    stdout = None if verbose else subprocess.DEVNULL
-    stderr = None if verbose else subprocess.PIPE
-
     try:
-        subprocess.run(cmd, check=True, stdout=stdout, stderr=stderr, text=True)
+        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
     except subprocess.CalledProcessError as exc:
-        if exc.stderr:
-            raise RuntimeError(exc.stderr.strip()) from exc
-        raise
+        raise RuntimeError(f"wgrib2 failed: {exc.stderr.strip()}") from exc
 
     if not tmp_out.exists() or tmp_out.stat().st_size == 0:
         tmp_out.unlink(missing_ok=True)
-        raise RuntimeError("wgrib2 produced empty output")
+        raise RuntimeError("wgrib2 produced empty output (no variables matched?)")
 
     tmp_out.replace(output_path)
 
+def process_single_step(
+    step: int,
+    cycle: datetime,
+    base_url: str,
+    cycle_root: Path,
+    tmp_root: Path,
+    bbox: tuple,
+    match_regex: str,
+    wgrib2_path: str,
+    args,
+    thread_index: int
+):
+    """Downloads and processes a single time step."""
+    req = GFSRequest(cycle=cycle, step_hours=step)
+    out_path = cycle_root / req.filename
+    step_info = f"f{req.step_str}"
 
-def _inventory_lines(wgrib2_bin: str, input_path: Path, *, verbose: bool) -> list[str]:
-    cmd = [wgrib2_bin, str(input_path), "-s"]
-    stderr = None if verbose else subprocess.PIPE
-    try:
-        result = subprocess.run(
-            cmd,
-            check=True,
-            stdout=subprocess.PIPE,
-            stderr=stderr,
-            text=True,
-        )
-    except subprocess.CalledProcessError as exc:
-        if exc.stderr:
-            raise RuntimeError(exc.stderr.strip()) from exc
-        raise
-    return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    if out_path.exists() and not args.overwrite:
+        return f"[{step_info}] Exists, skipping."
 
-
-def _dedupe_inventory_lines(lines: list[str]) -> tuple[list[str], bool]:
-    seen: set[str] = set()
-    kept: list[str] = []
-    for line in lines:
-        parts = line.split(":", 2)
-        if len(parts) < 3:
-            kept.append(line)
-            continue
-        key = parts[2]
-        if key in seen:
-            continue
-        seen.add(key)
-        kept.append(line)
-    return kept, len(kept) < len(lines)
-
-
-def dedupe_grib_records(
-    *,
-    wgrib2_bin: str,
-    input_path: Path,
-    verbose: bool,
-) -> None:
-    lines = _inventory_lines(wgrib2_bin, input_path, verbose=verbose)
-    kept, changed = _dedupe_inventory_lines(lines)
-    if not changed:
-        return
-
-    tmp_out = input_path.with_suffix(input_path.suffix + ".dedupe.part")
-    if tmp_out.exists():
-        tmp_out.unlink()
-
-    cmd = [
-        wgrib2_bin,
-        str(input_path),
-        "-set_grib_type",
-        "same",
-        "-i",
-        "-grib",
-        str(tmp_out),
-    ]
-    stdin_data = "\n".join(kept) + "\n"
-    stderr = None if verbose else subprocess.PIPE
+    source_path = tmp_root / f"{req.filename}_{os.getpid()}_{step}"
+    urls = [f"{base_url}/{key}" for key in req.s3_keys]
 
     try:
-        subprocess.run(
-            cmd,
-            check=True,
-            input=stdin_data,
-            stdout=subprocess.DEVNULL,
-            stderr=stderr,
-            text=True,
+        # Download with visual progress
+        download_with_fallback(
+            urls=urls,
+            out_path=source_path,
+            timeout=args.timeout,
+            retries=args.retries,
+            retry_delay=args.retry_delay_seconds,
+            user_agent="gfs-downloader",
+            step_info=step_info,
+            thread_pos=thread_index
         )
-    except subprocess.CalledProcessError as exc:
-        if exc.stderr:
-            raise RuntimeError(exc.stderr.strip()) from exc
-        raise
+        
+        subset_with_wgrib2(
+            wgrib2_bin=wgrib2_path,
+            input_path=source_path,
+            output_path=out_path,
+            bbox=bbox,
+            match_regex=match_regex,
+        )
+        
+        return f"[{step_info}] COMPLETED: {out_path.name}"
 
-    if not tmp_out.exists() or tmp_out.stat().st_size == 0:
-        tmp_out.unlink(missing_ok=True)
-        raise RuntimeError("wgrib2 dedupe produced empty output")
-
-    tmp_out.replace(input_path)
-
+    except Exception as exc:
+        return f"[{step_info}] FAILED: {exc}"
+    finally:
+        if source_path.exists() and not args.keep_source:
+            source_path.unlink()
 
 def main(argv: list[str]) -> int:
     p = argparse.ArgumentParser()
-    p.add_argument("--cycle", required=True, help="UTC cycle in YYYYMMDDHH format")
-    p.add_argument(
-        "--output-root",
-        default=str(default_output_root()),
-        help="Root output directory (default: data/raster_data/gfs_archive)",
-    )
+    p.add_argument("--cycle", required=True, help="UTC cycle YYYYMMDDHH")
+    p.add_argument("--output-root", default=str(default_output_root()))
     p.add_argument("--overwrite", action="store_true")
-    p.add_argument("--steps", type=int, nargs="+", help="Explicit step hours to download")
+    p.add_argument("--steps", type=int, nargs="+")
     p.add_argument("--max-step-hours", type=int, default=96)
     p.add_argument("--step-interval-hours", type=int, default=3)
-    p.add_argument(
-        "--area",
-        help=(
-            "Subset area as N/W/S/E (commas or slashes). "
-            "Example: 60/10/30/40. Default uses locations.csv with 1.5 deg buffer."
-        ),
-    )
+    p.add_argument("--area", help="N/W/S/E")
     p.add_argument("--buffer-deg", type=float, default=DEFAULT_BUFFER_DEG)
-    p.add_argument(
-        "--locations-csv",
-        default=str(Path(__file__).resolve().parents[2] / "locations.csv"),
-        help="Path to locations.csv (default: repo root locations.csv)",
-    )
+    p.add_argument("--locations-csv", default="locations.csv")
     p.add_argument("--bucket", default=DEFAULT_BUCKET)
-    p.add_argument(
-        "--base-url",
-        help="Override base URL (default: https://<bucket>.s3.amazonaws.com)",
-    )
+    p.add_argument("--base-url", help="Override base URL")
     p.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_SECONDS)
     p.add_argument("--retries", type=int, default=DEFAULT_RETRIES)
     p.add_argument("--retry-delay-seconds", type=float, default=DEFAULT_RETRY_DELAY_SECONDS)
     p.add_argument("--wgrib2-bin", default="wgrib2")
     p.add_argument("--keep-source", action="store_true")
-    p.add_argument("--verbose", action="store_true")
+    p.add_argument("--threads", type=int, default=DEFAULT_THREADS, help="Number of parallel downloads")
 
     args = p.parse_args(argv)
 
     try:
         cycle = parse_cycle(args.cycle)
-    except ValueError as exc:
-        print(f"Argument error: {exc}", file=sys.stderr)
-        return 2
-
-    try:
         area = parse_area(args.area)
         if area is None:
-            area = default_area_from_locations(
-                Path(args.locations_csv).expanduser().resolve(),
-                buffer_deg=args.buffer_deg,
-            )
-    except (ValueError, FileNotFoundError) as exc:
-        print(f"Argument error: {exc}", file=sys.stderr)
-        return 2
-
-    try:
+            area = default_area_from_locations(Path(args.locations_csv), buffer_deg=args.buffer_deg)
         steps = iter_steps(args.steps, args.max_step_hours, args.step_interval_hours)
-    except ValueError as exc:
-        print(f"Argument error: {exc}", file=sys.stderr)
-        return 2
-
-    try:
         wgrib2_path = ensure_wgrib2(args.wgrib2_bin)
-    except FileNotFoundError as exc:
-        print(f"Missing dependency: {exc}", file=sys.stderr)
-        return 2
-
-    try:
         bbox = wgrib2_bbox(area)
-    except ValueError as exc:
-        print(f"Argument error: {exc}", file=sys.stderr)
+    except Exception as exc:
+        print(f"Init Error: {exc}", file=sys.stderr)
         return 2
 
     base_url = args.base_url or f"https://{args.bucket}.s3.amazonaws.com"
     output_root = Path(args.output_root).expanduser().resolve()
     cycle_root = output_root / cycle.strftime("%Y%m%d%H")
     tmp_root = cycle_root / ".tmp"
+    tmp_root.mkdir(parents=True, exist_ok=True)
+    
     match_regex = build_match_regex()
+    
+    print(f"Starting Download for Cycle: {cycle}")
+    print(f"Target Area: {area}")
+    print(f"Parallel Threads: {args.threads}")
+    if TQDM_AVAILABLE:
+        print("Visual Mode: Active (tqdm)")
+    print("-" * 50)
+
     failures = 0
-
-    for step in steps:
-        req = GFSRequest(cycle=cycle, step_hours=step)
-        out_path = cycle_root / req.filename
-
-        if out_path.exists() and not args.overwrite:
-            print(f"Exists, skipping: {out_path}")
-            continue
-
-        source_path = tmp_root / req.filename
-        urls = [f"{base_url}/{key}" for key in req.s3_keys]
-
-        try:
-            download_with_fallback(
-                urls=urls,
-                out_path=source_path,
-                timeout=args.timeout,
-                retries=args.retries,
-                retry_delay=args.retry_delay_seconds,
-                user_agent="gfs-forecast-archiver",
+    
+    with ThreadPoolExecutor(max_workers=args.threads) as executor:
+        # Map futures to steps and assign a position index for tqdm
+        future_to_step = {}
+        for i, step in enumerate(steps):
+            # Position 0 is reserved for main log, so threads use 1 to N
+            thread_pos = (i % args.threads) + 1
+            future = executor.submit(
+                process_single_step, 
+                step, cycle, base_url, cycle_root, tmp_root, bbox, match_regex, wgrib2_path, args, thread_pos
             )
-            subset_with_wgrib2(
-                wgrib2_bin=wgrib2_path,
-                input_path=source_path,
-                output_path=out_path,
-                bbox=bbox,
-                match_regex=match_regex,
-                verbose=args.verbose,
-            )
-            dedupe_grib_records(
-                wgrib2_bin=wgrib2_path,
-                input_path=out_path,
-                verbose=args.verbose,
-            )
-            print(f"Saved: {out_path}")
-        except (DownloadError, RuntimeError, OSError) as exc:
-            failures += 1
-            print(f"Failed step {step:03d}: {exc}", file=sys.stderr)
-        finally:
-            if source_path.exists() and not args.keep_source:
-                source_path.unlink()
+            future_to_step[future] = step
+
+        for future in as_completed(future_to_step):
+            result_msg = future.result()
+            # If tqdm is used, use tqdm.write to avoid breaking progress bars
+            if TQDM_AVAILABLE:
+                tqdm.write(result_msg)
+            else:
+                print(result_msg)
+                
+            if "FAILED" in result_msg:
+                failures += 1
 
     if not args.keep_source:
         try:
@@ -528,6 +466,5 @@ def main(argv: list[str]) -> int:
 
     return 0 if failures == 0 else 1
 
-
 if __name__ == "__main__":
-    raise SystemExit(main(sys.argv[1:]))
+    raise SystemExit(main(sys.argv[1:]))    
