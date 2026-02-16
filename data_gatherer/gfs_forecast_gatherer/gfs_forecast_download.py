@@ -3,9 +3,13 @@
 Download GFS GRIB2 files from NOAA NOMADS (filter_gfs_0p25.pl).
 
 Defaults:
-- 2m temperature
-- temperature at 1000/925/850/700 hPa
-- geopotential height at 1000/925/850/700 hPa
+- 2m temperature (TMP)
+- 2m dew point (DPT)
+- 2m relative humidity (RH)
+- 10m winds (UGRD/VGRD)
+- total cloud cover (TCDC)
+- total precipitation (APCP)
+- surface solar radiation downwards (DSWRF)
 
 Files are saved as:
   gfs_<yyyymmddhh>_f<fff>.grib2
@@ -29,9 +33,9 @@ from urllib.request import Request, urlopen
 
 
 BASE_URL = "https://nomads.ncep.noaa.gov/cgi-bin/filter_gfs_0p25.pl"
-SURFACE_LEVELS = ("2_m_above_ground",)
-PRESSURE_LEVELS = ("1000_mb", "925_mb", "850_mb", "700_mb")
-VARIABLES = ("TMP", "HGT")
+SURFACE_LEVELS = ("2_m_above_ground", "10_m_above_ground")
+PRESSURE_LEVELS = ("surface", "entire_atmosphere")
+VARIABLES = ("TMP", "DPT", "RH", "UGRD", "VGRD", "TCDC", "APCP", "DSWRF")
 DEFAULT_BUFFER_DEG = 1.0
 DEFAULT_WAIT_INTERVAL_SECONDS = 60.0
 DEFAULT_MAX_WAIT_SECONDS = 7200.0

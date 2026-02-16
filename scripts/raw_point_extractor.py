@@ -6,8 +6,10 @@ import csv
 import math
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -20,6 +22,54 @@ import xarray as xr
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 GRAVITY_M_S2 = 9.80665
+GFS_INFERENCE_FEATURE_COLUMNS = [
+    "tmax_raw_c",
+    "tcc_mean_pct",
+    "tcc_max_pct",
+    "ws10_mean_mps",
+    "ws10_max_mps",
+    "td2m_mean_c",
+    "td2m_at_tmax_c",
+    "rh2m_at_tmax_c",
+    "t2m_diurnal_range",
+    "ssrd_day_total",
+    "tp_day_total",
+    "day_of_year_sin",
+    "day_of_year_cos",
+    "month",
+    "station_lat",
+    "station_lon",
+    "station_elev_m",
+    "city_name",
+]
+GFS_DAILY_OUTPUT_COLUMNS = [
+    "station_lat",
+    "station_lon",
+    "station_elev_m",
+    "city_name",
+    "local_timezone",
+    "model",
+    "issue_time_utc",
+    "target_date_local",
+    "tmax_time_utc",
+    "lead_time_hours",
+    "tmax_obs_c",
+    "tmax_raw_c",
+    "tcc_mean_pct",
+    "tcc_max_pct",
+    "ws10_mean_mps",
+    "ws10_max_mps",
+    "td2m_mean_c",
+    "td2m_at_tmax_c",
+    "rh2m_at_tmax_c",
+    "t2m_diurnal_range",
+    "ssrd_day_total",
+    "tp_day_total",
+    "day_of_year",
+    "day_of_year_sin",
+    "day_of_year_cos",
+    "month",
+]
 
 
 @dataclass(frozen=True)
@@ -462,6 +512,119 @@ def build_point_records(
     return out
 
 
+def _import_build_gfs_trainset_module():
+    scripts_dir = Path(__file__).resolve().parent
+    if str(scripts_dir) not in sys.path:
+        sys.path.insert(0, str(scripts_dir))
+    import build_gfs_trainset  # type: ignore
+
+    return build_gfs_trainset
+
+
+def _link_or_copy_file(src: Path, dst: Path) -> None:
+    try:
+        dst.symlink_to(src)
+        return
+    except OSError:
+        pass
+    try:
+        os.link(src, dst)
+        return
+    except OSError:
+        pass
+    shutil.copy2(src, dst)
+
+
+def build_gfs_daily_feature_records(
+    *,
+    grib_files: list[Path],
+    locations_csv: Path,
+    verbose: bool,
+) -> tuple[dict[str, pd.DataFrame], dict[str, str]]:
+    gfs_builder = _import_build_gfs_trainset_module()
+    logger = gfs_builder.setup_logging(
+        REPO_ROOT / "logs" / "raw_point_extractor_gfs.log",
+        logger_name="raw_point_extractor.gfs",
+        to_stdout=bool(verbose),
+    )
+
+    stations = gfs_builder.load_stations(locations_csv, logger)
+    obs_by_city = {
+        st.city_name: pd.DataFrame(columns=["city_name", "target_date_local", "tmax_obs_c"])
+        for st in stations
+    }
+
+    groups: dict[str, list[Path]] = {}
+    for path in grib_files:
+        init_dt, _lead = parse_init_and_lead_from_filename("gfs", path)
+        groups.setdefault(init_dt.strftime("%Y%m%d%H"), []).append(path)
+
+    out: dict[str, pd.DataFrame] = {}
+    end_str_by_init: dict[str, str] = {}
+    for init_str, paths in sorted(groups.items()):
+        with tempfile.TemporaryDirectory(prefix=f"raw_point_extractor_gfs_{init_str}_") as tmpdir:
+            tmpdir_path = Path(tmpdir)
+            for src in sorted(paths):
+                _link_or_copy_file(src, tmpdir_path / src.name)
+
+            issue_time_utc, _meta, _first_valid, last_valid = gfs_builder.inspect_cycle_gribs(
+                tmpdir_path, logger
+            )
+            instant_wide, interval_df, used_meta, step_ranges_seen = gfs_builder.extract_point_timeseries(
+                cycle_dir=tmpdir_path,
+                stations=stations,
+                issue_time_utc=issue_time_utc,
+                logger=logger,
+            )
+            gfs_builder.log_variable_choices(used_meta, step_ranges_seen, logger)
+            features_df = gfs_builder.compute_daily_features(
+                stations=stations,
+                issue_time_utc=issue_time_utc,
+                instant_wide=instant_wide,
+                interval_df=interval_df,
+                obs_by_city=obs_by_city,
+                used_meta=used_meta,
+                logger=logger,
+            )
+            features_df = gfs_builder.enforce_schema(features_df)
+            missing_required = sorted(set(GFS_INFERENCE_FEATURE_COLUMNS) - set(features_df.columns))
+            if missing_required:
+                raise ValueError(
+                    "Missing required GFS inference features: " + ", ".join(missing_required)
+                )
+            out[init_str] = features_df.sort_values(
+                ["city_name", "target_date_local"], kind="mergesort"
+            ).reset_index(drop=True)
+            end_str_by_init[init_str] = last_valid.strftime("%Y%m%d%H")
+    return out, end_str_by_init
+
+
+def enforce_gfs_daily_schema(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    for col in GFS_DAILY_OUTPUT_COLUMNS:
+        if col not in out.columns:
+            out[col] = np.nan
+    out = out[GFS_DAILY_OUTPUT_COLUMNS]
+
+    string_cols = ["city_name", "local_timezone", "model"]
+    for col in string_cols:
+        out[col] = out[col].astype("string")
+
+    out["issue_time_utc"] = pd.to_datetime(out["issue_time_utc"], utc=True, errors="coerce")
+    out["tmax_time_utc"] = pd.to_datetime(out["tmax_time_utc"], utc=True, errors="coerce")
+    out["target_date_local"] = pd.to_datetime(out["target_date_local"], errors="coerce").dt.date
+
+    numeric_cols = [
+        c
+        for c in GFS_DAILY_OUTPUT_COLUMNS
+        if c not in string_cols + ["issue_time_utc", "tmax_time_utc", "target_date_local"]
+    ]
+    for col in numeric_cols:
+        out[col] = pd.to_numeric(out[col], errors="coerce").astype(float)
+        out[col] = out[col].round(3)
+    return out
+
+
 def find_existing_parquet(out_dir: Path, *, model: str, init_str: str) -> Path | None:
     candidates = list(out_dir.glob(f"{model}_{init_str}_*.parquet"))
     if not candidates:
@@ -521,6 +684,55 @@ def write_or_append_parquet(
     return out_path
 
 
+def write_or_append_gfs_feature_parquet(
+    *,
+    init_str: str,
+    end_str_hint: str,
+    df_new: pd.DataFrame,
+    out_dir: Path,
+) -> Path:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    model = "gfs"
+    existing = find_existing_parquet(out_dir, model=model, init_str=init_str)
+    if existing:
+        df_old = pd.read_parquet(existing)
+        df = pd.concat([df_old, df_new], ignore_index=True)
+    else:
+        df = df_new.copy()
+
+    df = enforce_gfs_daily_schema(df)
+    df = df.dropna(subset=["city_name", "issue_time_utc", "target_date_local"])
+
+    dedupe_cols = [c for c in ("city_name", "issue_time_utc", "target_date_local") if c in df.columns]
+    if dedupe_cols:
+        df = df.drop_duplicates(subset=dedupe_cols, keep="last")
+    sort_cols = [c for c in ("city_name", "target_date_local") if c in df.columns]
+    if sort_cols:
+        df = df.sort_values(sort_cols, kind="mergesort")
+
+    end_candidates = [end_str_hint]
+    if existing:
+        match = re.fullmatch(rf"{re.escape(model)}_{init_str}_(\d{{10}})\.parquet", existing.name)
+        if match:
+            end_candidates.append(match.group(1))
+    if "tmax_time_utc" in df.columns:
+        tmax_time = pd.to_datetime(df["tmax_time_utc"], utc=True, errors="coerce").dropna()
+        if not tmax_time.empty:
+            end_candidates.append(tmax_time.max().to_pydatetime().strftime("%Y%m%d%H"))
+    end_str = max(end_candidates)
+
+    out_path = out_dir / f"{model}_{init_str}_{end_str}.parquet"
+    tmp_path = out_path.with_suffix(".parquet.part")
+    if tmp_path.exists():
+        tmp_path.unlink()
+    df.to_parquet(tmp_path, index=False)
+    tmp_path.replace(out_path)
+
+    if existing and existing != out_path:
+        existing.unlink(missing_ok=True)
+    return out_path
+
+
 def default_grib_dir(model: str, cycle: str) -> Path:
     if model not in {"ecmwf-hres", "ecmwf-aifs-single", "gfs"}:
         raise ValueError("--model must be one of: ecmwf-hres, ecmwf-aifs-single, gfs")
@@ -530,8 +742,8 @@ def default_grib_dir(model: str, cycle: str) -> Path:
 def main(argv: list[str]) -> int:
     p = argparse.ArgumentParser(
         description=(
-            "Bilinearly interpolate GRIB2 fields (2t/t/gh or 2t/t/z) onto locations.csv points, "
-            "then write/append a parquet in data/point_data/<model>/raw/."
+            "Extract forecast data into point parquet files under data/point_data/<model>/raw/. "
+            "For --model gfs, writes daily MOS feature rows ready for model inference."
         )
     )
     p.add_argument("--model", required=True, choices=["ecmwf-hres", "ecmwf-aifs-single", "gfs"])
@@ -592,21 +804,41 @@ def main(argv: list[str]) -> int:
         if leads:
             print(f"LeadHour min/max: {leads[0]}/{leads[-1]} (count={len(leads)})")
 
-    locations = load_locations(Path(args.locations_csv).expanduser().resolve())
-    dfs = build_point_records(model=args.model, grib_files=grib_files, locations=locations)
+    gfs_end_str_by_init: dict[str, str] = {}
+    if args.model == "gfs":
+        dfs, gfs_end_str_by_init = build_gfs_daily_feature_records(
+            grib_files=grib_files,
+            locations_csv=Path(args.locations_csv).expanduser().resolve(),
+            verbose=bool(args.verbose),
+        )
+    else:
+        locations = load_locations(Path(args.locations_csv).expanduser().resolve())
+        dfs = build_point_records(model=args.model, grib_files=grib_files, locations=locations)
 
     out_root = REPO_ROOT / "data" / "point_data" / args.model / "raw"
     for init_str, df in sorted(dfs.items()):
-        out_path = write_or_append_parquet(
-            model=args.model,
-            init_str=init_str,
-            df_new=df,
-            out_dir=out_root,
-        )
-        if args.verbose:
-            steps = df["ValidTimeUTC"].nunique()
-            cities = df["City"].nunique()
-            print(f"Init {init_str}: steps={steps}, cities={cities}, rows={len(df)}")
+        if args.model == "gfs":
+            out_path = write_or_append_gfs_feature_parquet(
+                init_str=init_str,
+                end_str_hint=gfs_end_str_by_init.get(init_str, init_str),
+                df_new=df,
+                out_dir=out_root,
+            )
+            if args.verbose:
+                days = df["target_date_local"].nunique() if "target_date_local" in df.columns else 0
+                cities = df["city_name"].nunique() if "city_name" in df.columns else 0
+                print(f"Init {init_str}: days={days}, cities={cities}, rows={len(df)}")
+        else:
+            out_path = write_or_append_parquet(
+                model=args.model,
+                init_str=init_str,
+                df_new=df,
+                out_dir=out_root,
+            )
+            if args.verbose:
+                steps = df["ValidTimeUTC"].nunique()
+                cities = df["City"].nunique()
+                print(f"Init {init_str}: steps={steps}, cities={cities}, rows={len(df)}")
         print(f"Wrote: {out_path}")
     return 0
 

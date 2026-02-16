@@ -1,2 +1,0 @@
-python data_gatherer/wunderground_observation_gatherer/observations_scraper.py --start-date 2000-01-01 --loop-minutes 1 --live-after-backfill
-python -m polymarket_archive.cli --config ../config.yaml run

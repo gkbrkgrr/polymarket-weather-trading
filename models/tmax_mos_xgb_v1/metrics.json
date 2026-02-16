@@ -1,0 +1,127 @@
+{
+  "cutoff_date": "2025-01-03",
+  "hyperparameters_used": {
+    "colsample_bytree": 0.8,
+    "early_stopping_rounds": 200,
+    "eval_metric": "rmse",
+    "learning_rate": 0.03,
+    "max_depth": 6,
+    "min_child_weight": 5,
+    "n_estimators": 8000,
+    "n_jobs": 32,
+    "objective": "reg:squarederror",
+    "random_state": 42,
+    "reg_lambda": 1.0,
+    "subsample": 0.8,
+    "tree_method": "hist",
+    "valid_frac": 0.2
+  },
+  "overall_metrics": {
+    "baseline_raw_gfs": {
+      "bias": -1.2613801851217004,
+      "mae": 2.2934065135413095,
+      "rmse": 3.2250263737975997
+    },
+    "corrected_mos": {
+      "bias": -0.03056049143795381,
+      "mae": 1.387395796108821,
+      "rmse": 1.855317525184035
+    }
+  },
+  "per_city_metrics": [
+    {
+      "baseline_bias": -3.6319265753424657,
+      "baseline_mae": 3.7174257534246578,
+      "baseline_rmse": 5.105365244256308,
+      "city_name": "Ankara",
+      "corrected_bias": -0.15784323869767253,
+      "corrected_mae": 1.2195000950100976,
+      "corrected_rmse": 1.682567876178782,
+      "rows": 1825
+    },
+    {
+      "baseline_bias": -0.4037304526748971,
+      "baseline_mae": 1.655770233196159,
+      "baseline_rmse": 2.120485707521385,
+      "city_name": "Atlanta",
+      "corrected_bias": -0.10905140431089753,
+      "corrected_mae": 1.380314881575897,
+      "corrected_rmse": 1.855144679731404,
+      "rows": 1458
+    },
+    {
+      "baseline_bias": -0.346218792866941,
+      "baseline_mae": 1.8952626886145403,
+      "baseline_rmse": 2.3428376078864916,
+      "city_name": "BuenosAires",
+      "corrected_bias": -0.7049723895136946,
+      "corrected_mae": 1.536339036187031,
+      "corrected_rmse": 1.9599377144632393,
+      "rows": 1458
+    },
+    {
+      "baseline_bias": 0.6761289437585735,
+      "baseline_mae": 1.8946378600823048,
+      "baseline_rmse": 2.4388905317916794,
+      "city_name": "Dallas",
+      "corrected_bias": 0.4399860670996424,
+      "corrected_mae": 1.6013378696051745,
+      "corrected_rmse": 2.1413463643260173,
+      "rows": 1458
+    },
+    {
+      "baseline_bias": -1.53814301369863,
+      "baseline_mae": 2.1863731506849318,
+      "baseline_rmse": 3.2410684474561613,
+      "city_name": "London",
+      "corrected_bias": 0.0575502405090167,
+      "corrected_mae": 1.3723314556943667,
+      "corrected_rmse": 1.8171975884546778,
+      "rows": 1825
+    },
+    {
+      "baseline_bias": -0.8432105624142662,
+      "baseline_mae": 1.6534451303155007,
+      "baseline_rmse": 2.2192214497286042,
+      "city_name": "NYC",
+      "corrected_bias": -0.07685665721506452,
+      "corrected_mae": 1.385458268583517,
+      "corrected_rmse": 1.9494782611204853,
+      "rows": 1458
+    },
+    {
+      "baseline_bias": 0.040397252747252727,
+      "baseline_mae": 1.6578203296703298,
+      "baseline_rmse": 2.23636149535626,
+      "city_name": "Seattle",
+      "corrected_bias": 0.070420799840212,
+      "corrected_mae": 1.2956254370241098,
+      "corrected_rmse": 1.6552032990646646,
+      "rows": 1820
+    },
+    {
+      "baseline_bias": -3.358388493150685,
+      "baseline_mae": 3.6435884931506854,
+      "baseline_rmse": 4.523617340077745,
+      "city_name": "Seoul",
+      "corrected_bias": 0.20245750011257932,
+      "corrected_mae": 1.4018015876495347,
+      "corrected_rmse": 1.8176331225299716,
+      "rows": 1825
+    },
+    {
+      "baseline_bias": -1.0763278463648835,
+      "baseline_mae": 1.8227764060356655,
+      "baseline_rmse": 2.3566484947000514,
+      "city_name": "Toronto",
+      "corrected_bias": -0.07060139064359529,
+      "corrected_mae": 1.3590663455348182,
+      "corrected_rmse": 1.87954575971129,
+      "rows": 1458
+    }
+  ],
+  "rows_loaded_before_cleaning": 82125,
+  "rows_removed_missing_required": 9125,
+  "train_rows": 58415,
+  "valid_rows": 14585
+}
