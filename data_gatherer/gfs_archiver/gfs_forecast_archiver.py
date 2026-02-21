@@ -41,6 +41,9 @@ except ImportError:
     TQDM_AVAILABLE = False
     print("WARNING: 'tqdm' library not found. For progress bars run: pip install tqdm")
 
+if os.environ.get("NO_TQDM") == "1":
+    TQDM_AVAILABLE = False
+
 # --- CONSTANTS ---
 DEFAULT_BUCKET = "noaa-gfs-bdp-pds"
 DEFAULT_BUFFER_DEG = 1.5

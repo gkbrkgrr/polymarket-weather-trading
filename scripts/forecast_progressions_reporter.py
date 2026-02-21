@@ -14,6 +14,7 @@ from matplotlib.ticker import MaxNLocator
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_INPUT_ROOT = REPO_ROOT / "data" / "ml_predictions" / "xgb_opt"
 DEFAULT_OUTPUT_DIR = REPO_ROOT / "reports" / "forecast_progressions"
+DEFAULT_LOCATIONS_CSV = REPO_ROOT / "locations.csv"
 REQUIRED_COLUMNS = ["city_name", "issue_time_utc", "target_date_local", "Forecast"]
 CYCLE_TOKEN_PATTERN = re.compile(r"(\d{10})$")
 
@@ -45,6 +46,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "GFS cycle token (YYYYMMDDHH). "
             "If omitted, the latest available cycle is used."
         ),
+    )
+    parser.add_argument(
+        "--locations-csv",
+        type=Path,
+        default=DEFAULT_LOCATIONS_CSV,
+        help=f"Locations CSV used to detect USA cities (default: {DEFAULT_LOCATIONS_CSV})",
     )
     return parser.parse_args(argv)
 
@@ -97,6 +104,22 @@ def resolve_cycle_token(requested_cycle: str | None, available_tokens: list[str]
     return requested_cycle
 
 
+def discover_usa_cities(locations_csv: Path) -> set[str]:
+    if not locations_csv.exists():
+        raise SystemExit(f"Locations CSV not found: {locations_csv}")
+    loc_df = pd.read_csv(locations_csv)
+    required = {"name", "url"}
+    missing = required - set(loc_df.columns)
+    if missing:
+        raise SystemExit(
+            f"Locations CSV is missing required columns: {', '.join(sorted(missing))}"
+        )
+    names = loc_df["name"].astype(str).str.strip()
+    urls = loc_df["url"].astype(str).str.strip().str.lower()
+    usa_mask = urls.str.contains("/daily/us/", regex=False)
+    return set(names[usa_mask].tolist())
+
+
 def load_city_predictions(city_dir: Path) -> pd.DataFrame:
     files = sorted(city_dir.glob("*.parquet"))
     if not files:
@@ -112,7 +135,6 @@ def load_city_predictions(city_dir: Path) -> pd.DataFrame:
     df["target_date_local"] = pd.to_datetime(df["target_date_local"], errors="coerce").dt.date
     df["Forecast"] = pd.to_numeric(df["Forecast"], errors="coerce")
     df = df.dropna(subset=["city_name", "issue_time_utc", "target_date_local", "Forecast"]).copy()
-    df["forecast_rounded"] = df["Forecast"].round().astype(int)
     return df
 
 
@@ -125,7 +147,7 @@ def collect_predictions(city_dirs: list[Path]) -> tuple[pd.DataFrame, list[str]]
         city_df = load_city_predictions(city_dir)
         if city_df.empty:
             city_df = pd.DataFrame(
-                columns=["city_name", "issue_time_utc", "target_date_local", "Forecast", "forecast_rounded"]
+                columns=["city_name", "issue_time_utc", "target_date_local", "Forecast"]
             )
         else:
             city_df["city_name"] = city_name
@@ -211,9 +233,18 @@ def main(argv: list[str] | None = None) -> int:
     available_cycles = discover_cycle_tokens(city_dirs)
     latest_cycle_token = max(available_cycles)
     cycle_token = resolve_cycle_token(args.cycle, available_cycles)
+    cycle_utc = pd.to_datetime(cycle_token, format="%Y%m%d%H", utc=True)
+    usa_cities = discover_usa_cities(args.locations_csv)
     df, cities = collect_predictions(city_dirs)
+
+    usa_mask = df["city_name"].isin(usa_cities)
+    df.loc[usa_mask, "Forecast"] = (df.loc[usa_mask, "Forecast"] * 9.0 / 5.0) + 32.0
+    df["forecast_rounded"] = df["Forecast"].round().astype(int)
+
     local_days = select_local_days_from_cycle(df=df, cycle_token=cycle_token)
-    df_filtered = df[df["target_date_local"].isin(local_days)].copy()
+    df_filtered = df[
+        (df["target_date_local"].isin(local_days)) & (df["issue_time_utc"] <= cycle_utc)
+    ].copy()
     output_pdf = build_output_pdf_path(args.output_dir, cycle_token)
     pages = render_pdf(df=df_filtered, cities=cities, output_pdf=output_pdf, local_days=local_days)
 
@@ -221,6 +252,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Cities: {', '.join(cities)}")
     print(f"Cycle used: {cycle_token}")
     print(f"Latest cycle: {latest_cycle_token}")
+    print(f"USA cities converted to Fahrenheit: {', '.join(sorted(usa_cities))}")
     print(f"Local days from cycle: {len(local_days)}")
     print(f"Pages written: {pages}")
     print(f"Wrote PDF: {output_pdf}")

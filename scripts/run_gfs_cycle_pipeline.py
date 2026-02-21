@@ -15,6 +15,7 @@ CYCLE_PATTERN = re.compile(r"^\d{10}$")
 DEFAULT_TELEGRAM_CREDENTIALS_FILE = REPO_ROOT / ".secrets" / "telegram_bot.json"
 
 # GFS issue cycle hour -> nominal publish time in UTC.
+# Keep these in UTC regardless of server local timezone; cron should run at local equivalents.
 PUBLISH_SCHEDULE_UTC: list[tuple[int, time]] = [
     (0, time(3, 30)),
     (6, time(9, 30)),
@@ -133,6 +134,7 @@ def build_commands(
     telegram_credentials_file: Path,
 ) -> list[list[str]]:
     scripts_dir = repo_root / "scripts"
+    is_00z = cycle.endswith("00")
 
     commands: list[list[str]] = []
     commands.append(
@@ -169,17 +171,27 @@ def build_commands(
         ]
     )
 
-    if not skip_telegram:
+    # Full model performance heatmap report is generated only for 00Z cycles.
+    if is_00z:
         commands.append(
             [
                 str(python_bin),
-                str(scripts_dir / "telegram_publish_report.py"),
-                "--cycle",
-                cycle,
-                "--credentials-file",
-                str(telegram_credentials_file),
+                str(scripts_dir / "model_performances_reporter.py"),
             ]
         )
+
+    if not skip_telegram:
+        telegram_cmd = [
+            str(python_bin),
+            str(scripts_dir / "telegram_publish_report.py"),
+            "--cycle",
+            cycle,
+            "--credentials-file",
+            str(telegram_credentials_file),
+        ]
+        if is_00z:
+            telegram_cmd.append("--include-heatmap")
+        commands.append(telegram_cmd)
     return commands
 
 

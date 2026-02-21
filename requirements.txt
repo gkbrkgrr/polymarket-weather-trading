@@ -22,3 +22,8 @@ matplotlib
 
 # Used for hourly forecast imputation during GRIB -> parquet writes.
 scipy
+
+# Needed for bias_correction Stage-B residual model
+scikit-learn
+xgboost
+joblib

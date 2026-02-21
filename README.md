@@ -115,3 +115,85 @@ POSTGRES_DSN=postgresql://archive_user:password@127.0.0.1:5432/polymarket_archiv
 ```
 
 If `POSTGRES_DSN` is not set, database-backed tests are skipped.
+
+## Bias Correction Pipeline
+
+The repo now includes a production-oriented, leakage-safe bias-correction pipeline for daily Tmax prediction archives:
+
+- CLI entrypoint: `python bias_correction/run_bias_correction.py`
+- Config example: `bias_correction/config.example.yaml`
+- Artifacts/logs: `bias_correction/artifacts/<run_timestamp>/`
+
+### Expected Input Schema
+
+Prediction parquet files can vary by model, but each file must be normalizable to:
+
+- `station_name` (aliases: `station`, `Station`, `station_id`; if missing, fallback derived from `station_lat/station_lon`, otherwise city)
+- `city` (aliases: `City`, `city_name`)
+- `issue_time_utc` (aliases: `InitTimeUTC`, `init_time`, `cycle`, `issue_time`)
+- `target_date` day label (aliases: `valid_date_local`, `target_date_local`, `valid_time_local`; if only UTC valid time exists, UTC/local fallback is applied with warning)
+- `lead_hours` (aliases: `LeadHour`, `lead_time_hours`)
+- `cycle` (derived from `issue_time_utc` hour if missing)
+- `tmax_pred` prediction (auto-detected from common names such as `tmax_pred`, `prediction`, `yhat`, `Forecast`)
+- `tmax_obs` observations (`tmax_obs`, `tmax_obs_c`, etc.) or provided via `--obs_source_path`
+
+### Leakage-Safety Design
+
+- Stage A (EWMA bias) is strictly online.
+- For issue time `T`, correction uses only residual history from issue times `< T`.
+- Rows sharing the same issue time are scored first, then history is updated.
+- Stage B is trained on Stage-A-corrected residual targets with time-based validation split.
+
+### Outputs
+
+- Output folders are sibling model directories with suffix `_biascorrected`:
+  - `data/ml_predictions/xgb_biascorrected/...`
+  - `data/ml_predictions/xgb_opt_biascorrected/...`
+  - future models auto-discovered as `data/ml_predictions/<new_model>_biascorrected/...`
+- City subfolder and filename are preserved; only parent model directory changes.
+
+### Run Examples
+
+Train + backfill all discovered models:
+
+```bash
+python bias_correction/run_bias_correction.py \
+  --predictions_root "/home/gkbrkgrr/Desktop/polymarket-weather-trading/data/ml_predictions" \
+  --train_start "2025010100" --train_end "2025123118" \
+  --backfill_start "2026010100" --backfill_end "latest" \
+  --rolling_window_days 45 \
+  --ewma_halflife_days 14 \
+  --min_history 30 \
+  --model_strategy "single_residual_with_model_feature" \
+  --obs_source_path "/home/gkbrkgrr/Desktop/polymarket-weather-trading/data/observations" \
+  --n_jobs 8
+```
+
+Only one model:
+
+```bash
+python bias_correction/run_bias_correction.py \
+  --predictions_root "/home/gkbrkgrr/Desktop/polymarket-weather-trading/data/ml_predictions" \
+  --models "xgb_opt" \
+  --train_start "2025010100" --train_end "2025123118" \
+  --backfill_start "2026010100" --backfill_end "latest" \
+  --obs_source_path "/home/gkbrkgrr/Desktop/polymarket-weather-trading/data/observations"
+```
+
+Dry-run discovery and write plan:
+
+```bash
+python bias_correction/run_bias_correction.py \
+  --predictions_root "/home/gkbrkgrr/Desktop/polymarket-weather-trading/data/ml_predictions" \
+  --train_start "2025010100" --train_end "2025123118" \
+  --backfill_start "2026010100" --backfill_end "latest" \
+  --dry_run
+```
+
+### Adding New Model Directories
+
+Place files under:
+
+`data/ml_predictions/<new_model>/<City>/*.parquet`
+
+No code changes are needed if the parquet schema can be normalized by aliases/fallback rules above.

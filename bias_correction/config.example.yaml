@@ -1,0 +1,32 @@
+# Bias-correction pipeline example configuration
+predictions_root: /home/gkbrkgrr/Desktop/polymarket-weather-trading/data/ml_predictions
+train_start: "2025010100"
+train_end: "2025123118"
+backfill_start: "2026010100"
+backfill_end: latest
+rolling_window_days: 45
+ewma_halflife_days: 14
+min_history: 30
+model_strategy: single_residual_with_model_feature
+n_jobs: 8
+
+# null means auto-discover all model directories under predictions_root
+models: null
+
+# Outputs go to <model_name>_biascorrected sibling directories
+output_suffix: _biascorrected
+
+# Optional. If prediction parquet lacks tmax_obs, load observations from this source.
+# Can be either a directory of city parquet files or a single parquet file.
+obs_source_path: /home/gkbrkgrr/Desktop/polymarket-weather-trading/data/observations
+
+# Intermediate caches to avoid re-parsing every run
+intermediate_dir: /home/gkbrkgrr/Desktop/polymarket-weather-trading/bias_correction/intermediate
+artifacts_root: /home/gkbrkgrr/Desktop/polymarket-weather-trading/bias_correction/artifacts
+reuse_intermediate: true
+
+# Runtime controls
+dry_run: false
+strict_schema: false
+overwrite_output: true
+log_level: INFO

@@ -7,3 +7,5 @@ logs/
 reports/
 outputs/
 .secrets/
+2022_gfs_backfill.log
+backfill_gfs.sh

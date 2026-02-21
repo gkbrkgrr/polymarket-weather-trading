@@ -1,0 +1,22 @@
+{
+  "strategy": "single_residual_with_model_feature",
+  "models": {
+    "__all__": {
+      "split": {
+        "cutoff_date": "2025-11-01",
+        "train_rows": 103208,
+        "valid_rows": 21534
+      },
+      "stage_a_baseline": {
+        "rmse": 1.7776205799127873,
+        "mae": 1.3107779026284696,
+        "bias": 0.004583082902043155
+      },
+      "stage_b_corrected": {
+        "rmse": 1.9532123281241347,
+        "mae": 1.4727629139393337,
+        "bias": 0.5218589082032954
+      }
+    }
+  }
+}
