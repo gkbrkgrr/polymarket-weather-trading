@@ -14,7 +14,7 @@ from polymarket_archive.utils import parse_datetime
 
 
 def _schema_path() -> Path:
-    return Path(__file__).resolve().parent / "ddl" / "schema.sql"
+    return Path(__file__).resolve().parents[2] / "migrations" / "master_db_schema.sql"
 
 
 def _parse_time(value: str) -> datetime:

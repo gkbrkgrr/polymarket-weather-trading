@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 import orjson
+from psycopg.conninfo import conninfo_to_dict, make_conninfo
 import yaml
 from pydantic import BaseModel, Field
 
@@ -95,13 +96,28 @@ def _merge_settings(base: dict[str, Any], override: dict[str, Any]) -> dict[str,
     return merged
 
 
+def _dsn_with_master_db(dsn: str, dbname: str = "master_db") -> str:
+    parts = conninfo_to_dict(dsn)
+    if not parts:
+        return dsn
+    parts["dbname"] = dbname
+    return make_conninfo(**parts)
+
+
 def load_settings(config_path: str | Path | None = None) -> Settings:
     data: dict[str, Any] = {}
     if config_path:
         data = _load_file(Path(config_path))
 
+    file_master_dsn = data.get("master_postgres_dsn") or data.get("MASTER_POSTGRES_DSN")
+    file_base_dsn = data.get("postgres_dsn") or data.get("POSTGRES_DSN")
+
     file_overrides = {
-        "postgres_dsn": data.get("postgres_dsn") or data.get("POSTGRES_DSN"),
+        "postgres_dsn": (
+            file_master_dsn
+            if file_master_dsn
+            else (_dsn_with_master_db(file_base_dsn) if file_base_dsn else None)
+        ),
         "gamma_base_url": data.get("gamma_base_url") or data.get("GAMMA_BASE_URL"),
         "data_base_url": data.get("data_base_url") or data.get("DATA_BASE_URL"),
         "clob_base_url": data.get("clob_base_url") or data.get("CLOB_BASE_URL"),
@@ -133,8 +149,10 @@ def load_settings(config_path: str | Path | None = None) -> Settings:
 
     env = os.environ
     env_overrides: dict[str, Any] = {}
-    if env.get("POSTGRES_DSN"):
-        env_overrides["postgres_dsn"] = env.get("POSTGRES_DSN")
+    if env.get("MASTER_POSTGRES_DSN"):
+        env_overrides["postgres_dsn"] = env.get("MASTER_POSTGRES_DSN")
+    elif env.get("POSTGRES_DSN"):
+        env_overrides["postgres_dsn"] = _dsn_with_master_db(env.get("POSTGRES_DSN") or "")
     if env.get("GAMMA_BASE_URL"):
         env_overrides["gamma_base_url"] = env.get("GAMMA_BASE_URL")
     if env.get("DATA_BASE_URL"):
