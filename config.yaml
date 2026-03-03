@@ -2,10 +2,13 @@ gamma_base_url: https://gamma-api.polymarket.com
 postgres_dsn: postgresql://archive_user:password@127.0.0.1:5432/polymarket_archive
 data_base_url: https://data-api.polymarket.com
 clob_base_url: https://clob.polymarket.com
-clob_ws_url: wss://ws-subscriptions-clob.polymarket.com/ws
+clob_ws_url: wss://ws-subscriptions-clob.polymarket.com/ws/market
+backfill_start: 2025-01-01T00:00:00Z
 
 target_market_ids: []
 market_filters: []
+market_tag_ids:
+  - 84
 #market_title_contains:
 #  - temperature
 #  - weather

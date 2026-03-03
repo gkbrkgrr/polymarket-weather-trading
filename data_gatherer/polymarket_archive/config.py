@@ -18,10 +18,11 @@ class Settings(BaseModel):
     gamma_base_url: str = "https://gamma-api.polymarket.com"
     data_base_url: str = "https://data-api.polymarket.com"
     clob_base_url: str = "https://clob.polymarket.com"
-    clob_ws_url: str = "wss://ws-subscriptions-clob.polymarket.com/ws"
+    clob_ws_url: str = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
     title_filter: str | None = "Highest temperature"
     market_title_contains: list[str] = Field(default_factory=list)
     market_filters: list[str] = Field(default_factory=list)
+    market_tag_ids: list[int] = Field(default_factory=list)
     target_market_ids: list[str] = Field(default_factory=list)
     backfill_start: datetime = Field(
         default_factory=lambda: datetime(2026, 1, 1, tzinfo=timezone.utc)
@@ -87,6 +88,32 @@ def _coerce_str_list(value: Any) -> list[str]:
     return [str(value).strip()]
 
 
+def _coerce_int_list(value: Any) -> list[int]:
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple, set)):
+        out: list[int] = []
+        for item in value:
+            text = str(item).strip()
+            if not text:
+                continue
+            out.append(_coerce_int(text))
+        return out
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return []
+        if text.startswith("["):
+            try:
+                parsed = orjson.loads(text)
+            except orjson.JSONDecodeError:
+                parsed = None
+            if isinstance(parsed, list):
+                return _coerce_int_list(parsed)
+        return [_coerce_int(part.strip()) for part in text.split(",") if part.strip()]
+    return [_coerce_int(value)]
+
+
 def _merge_settings(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
     merged = dict(base)
     for key, value in override.items():
@@ -126,6 +153,7 @@ def load_settings(config_path: str | Path | None = None) -> Settings:
         "market_title_contains": data.get("market_title_contains")
         or data.get("MARKET_TITLE_CONTAINS"),
         "market_filters": data.get("market_filters") or data.get("MARKET_FILTERS"),
+        "market_tag_ids": data.get("market_tag_ids") or data.get("MARKET_TAG_IDS"),
         "target_market_ids": data.get("target_market_ids")
         or data.get("TARGET_MARKET_IDS"),
         "backfill_start": data.get("backfill_start") or data.get("BACKFILL_START"),
@@ -167,6 +195,8 @@ def load_settings(config_path: str | Path | None = None) -> Settings:
         env_overrides["market_title_contains"] = env.get("MARKET_TITLE_CONTAINS")
     if env.get("MARKET_FILTERS"):
         env_overrides["market_filters"] = env.get("MARKET_FILTERS")
+    if env.get("MARKET_TAG_IDS"):
+        env_overrides["market_tag_ids"] = env.get("MARKET_TAG_IDS")
     if env.get("TARGET_MARKET_IDS"):
         env_overrides["target_market_ids"] = env.get("TARGET_MARKET_IDS")
     if env.get("BACKFILL_START"):
@@ -207,6 +237,8 @@ def load_settings(config_path: str | Path | None = None) -> Settings:
     for key in ("market_title_contains", "market_filters", "target_market_ids"):
         if merged.get(key) is not None:
             merged[key] = _coerce_str_list(merged.get(key))
+    if merged.get("market_tag_ids") is not None:
+        merged["market_tag_ids"] = _coerce_int_list(merged.get("market_tag_ids"))
     for key in (
         "poll_interval_seconds",
         "discovery_interval_seconds",

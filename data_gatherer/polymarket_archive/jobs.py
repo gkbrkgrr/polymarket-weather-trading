@@ -65,8 +65,10 @@ async def run_backfill(
             gamma,
             title_filters,
             settings.market_filters,
+            settings.market_tag_ids,
             settings.target_market_ids,
             settings.markets_page_size,
+            start_date_min=start_ts,
             on_batch=_on_batch,
         )
         await _ingest_trades_concurrently(
@@ -94,8 +96,10 @@ async def run_live_once(settings: Settings, db: Database, run_id: str | None = N
             gamma,
             title_filters,
             settings.market_filters,
+            settings.market_tag_ids,
             settings.target_market_ids,
             settings.markets_page_size,
+            start_date_min=settings.backfill_start,
             on_batch=_on_batch,
         )
         market_ids = await db.list_market_condition_ids()
@@ -125,6 +129,8 @@ async def run_live_loop(settings: Settings, db: Database) -> None:
         )
         clob_task: asyncio.Task | None = None
         clob_rest_task: asyncio.Task | None = None
+        clob_client: ClobClient | None = None
+        rest_client: ClobRestClient | None = None
         token_map: dict[str, tuple[str, int | None]] = {}
         if settings.feature_clob:
             token_map = await _build_clob_token_map(db)
@@ -149,13 +155,18 @@ async def run_live_loop(settings: Settings, db: Database) -> None:
 
             def _start_rest() -> None:
                 nonlocal clob_rest_task
-                if clob_rest_task is None:
+                if rest_client is not None and clob_rest_task is None:
                     clob_rest_task = asyncio.create_task(rest_client.run(token_map))
                     clob_rest_task.add_done_callback(
                         lambda task: _log_task_result(task, logger, "clob_rest")
                     )
 
-            if settings.clob_ws_url:
+            def _start_ws() -> None:
+                nonlocal clob_task
+                if clob_client is None or clob_task is not None:
+                    return
+                if not token_map:
+                    return
                 clob_task = asyncio.create_task(clob_client.run(token_map))
 
                 def _on_ws_done(task: asyncio.Task) -> None:
@@ -168,6 +179,9 @@ async def run_live_loop(settings: Settings, db: Database) -> None:
                         _start_rest()
 
                 clob_task.add_done_callback(_on_ws_done)
+
+            if settings.clob_ws_url:
+                _start_ws()
             else:
                 _start_rest()
 
@@ -182,13 +196,19 @@ async def run_live_loop(settings: Settings, db: Database) -> None:
                     gamma,
                     title_filters,
                     settings.market_filters,
+                    settings.market_tag_ids,
                     settings.target_market_ids,
                     settings.markets_page_size,
+                    start_date_min=settings.backfill_start,
                     on_batch=_on_batch,
                 )
                 last_discovery = now
                 if settings.feature_clob:
                     await _refresh_clob_token_map(db, token_map, logger)
+                    if settings.clob_ws_url:
+                        _start_ws()
+                    else:
+                        _start_rest()
 
             market_ids = await db.list_market_condition_ids()
             await _ingest_trades_for_market_ids(

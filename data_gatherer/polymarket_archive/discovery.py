@@ -4,8 +4,6 @@ from datetime import datetime, timezone
 import asyncio
 from typing import Awaitable, Callable, Iterable
 
-import httpx
-
 from polymarket_archive.gamma_client import GammaClient, filter_markets, parse_market
 from polymarket_archive.models import GammaMarket
 
@@ -14,37 +12,56 @@ async def discover_markets(
     client: GammaClient,
     title_filters: Iterable[str],
     market_filters: Iterable[str],
+    market_tag_ids: Iterable[int] | None,
     target_market_ids: Iterable[str],
     page_size: int,
+    start_date_min: datetime | None = None,
     on_batch: Callable[[list[GammaMarket]], Awaitable[None]] | None = None,
 ) -> list[GammaMarket]:
     markets: dict[str, GammaMarket] = {}
-    search_terms = [term for term in title_filters if str(term).strip()]
-    if not search_terms:
-        search_terms = [None]
+    tag_ids = [int(tag) for tag in (market_tag_ids or []) if str(tag).strip()]
+    if not tag_ids:
+        tag_ids = [None]
 
-    for search in search_terms:
+    for tag_id in tag_ids:
         offset = 0
+        previous_page_ids: tuple[str, ...] | None = None
+        seen_page_signatures: set[tuple[str, ...]] = set()
         while True:
-            try:
-                page, _ = await client.list_markets(search, page_size, offset)
-            except httpx.HTTPStatusError:
-                if search is not None:
-                    search = None
-                    offset = 0
-                    markets = {}
-                    continue
-                raise
+            page, _ = await client.list_markets(
+                search=None,
+                limit=page_size,
+                offset=offset,
+                start_date_min=start_date_min,
+                tag_id=tag_id,
+            )
             if not page:
                 break
+
+            raw_page_ids: tuple[str, ...] = tuple(
+                str(payload.get("id") or payload.get("market_id") or payload.get("marketId") or "")
+                for payload in page
+                if isinstance(payload, dict)
+            )
+            if raw_page_ids:
+                # Some Gamma endpoints may ignore offset and repeat the same page forever.
+                if previous_page_ids is not None and raw_page_ids == previous_page_ids:
+                    break
+                if raw_page_ids in seen_page_signatures:
+                    break
+                seen_page_signatures.add(raw_page_ids)
+                previous_page_ids = raw_page_ids
+
             parsed = _parse_markets(client, page)
             filtered = filter_markets(parsed, title_filters, market_filters, target_market_ids)
             if filtered and on_batch is not None:
                 result = on_batch(filtered)
                 if asyncio.iscoroutine(result):
                     await result
+
             for market in filtered:
                 markets[market.market_id] = market
+
             next_offset = offset + len(page)
             if next_offset <= offset:
                 break

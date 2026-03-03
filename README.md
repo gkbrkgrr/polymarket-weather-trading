@@ -41,9 +41,10 @@ Supported environment variables:
 - `POSTGRES_DSN`
 - `GAMMA_BASE_URL` (default `https://gamma-api.polymarket.com`)
 - `DATA_BASE_URL` (default `https://data-api.polymarket.com`)
-- `CLOB_WS_URL` (default `wss://ws-subscriptions-clob.polymarket.com/ws`)
+- `CLOB_WS_URL` (default `wss://ws-subscriptions-clob.polymarket.com/ws/market`)
 - `CLOB_BASE_URL` (default `https://clob.polymarket.com`)
 - `TITLE_FILTER` (default `Highest temperature`)
+- `MARKET_TAG_IDS` (default empty; use `84` for weather)
 - `BACKFILL_START` (default `2026-01-01T00:00:00Z`)
 - `POLL_INTERVAL_SECONDS` (default `30`)
 - `DISCOVERY_INTERVAL_SECONDS` (default `300`)
@@ -57,9 +58,10 @@ Example `config.yaml`:
 postgres_dsn: postgresql://archive_user:password@127.0.0.1:5432/master_db
 gamma_base_url: https://gamma-api.polymarket.com
 data_base_url: https://data-api.polymarket.com
-clob_ws_url: wss://ws-subscriptions-clob.polymarket.com/ws
+clob_ws_url: wss://ws-subscriptions-clob.polymarket.com/ws/market
 clob_base_url: https://clob.polymarket.com
 title_filter: Highest temperature
+market_tag_ids: [84]
 backfill_start: 2026-01-01T00:00:00Z
 poll_interval_seconds: 30
 discovery_interval_seconds: 300

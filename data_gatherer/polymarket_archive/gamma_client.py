@@ -30,12 +30,26 @@ class GammaClient:
         self.run_id = run_id
 
     async def list_markets(
-        self, search: str | None, limit: int, offset: int
+        self,
+        search: str | None,
+        limit: int,
+        offset: int,
+        start_date_min: datetime | None = None,
+        tag_id: int | None = None,
     ) -> tuple[list[dict[str, Any]], datetime]:
         url = f"{self.base_url}/markets"
         params: dict[str, Any] = {"limit": limit, "offset": offset}
         if search:
             params["search"] = search
+        if tag_id is not None:
+            params["tag_id"] = int(tag_id)
+        if start_date_min is not None:
+            utc_start = start_date_min
+            if utc_start.tzinfo is None:
+                utc_start = utc_start.replace(tzinfo=timezone.utc)
+            else:
+                utc_start = utc_start.astimezone(timezone.utc)
+            params["start_date_min"] = utc_start.isoformat().replace("+00:00", "Z")
         ts = datetime.now(timezone.utc)
         payload = await fetch_json(
             self.client, "GET", url, params, limiter=self.limiter, max_retries=self.max_retries

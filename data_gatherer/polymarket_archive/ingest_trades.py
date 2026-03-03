@@ -24,14 +24,23 @@ async def ingest_trades_for_market(
     next_cursor: str | None = None
     current_cursor = cursor
     effective_start = current_cursor.last_ts
+    seen_page_cursors: set[str] = set()
 
-    market_param = condition_id or await db.get_condition_id(market_id) or market_id
+    # Data API `/trades` expects condition id in `market` for weather contracts.
+    # Fall back to market id when condition id is unavailable.
+    market_param = condition_id or market_id
 
     while True:
+        request_cursor = next_cursor
+        if request_cursor:
+            if request_cursor in seen_page_cursors:
+                break
+            seen_page_cursors.add(request_cursor)
+
         page, next_cursor, _ = await client.list_trades(
             market_param=market_param,
             market_id=market_id,
-            cursor=next_cursor,
+            cursor=request_cursor,
             limit=page_size,
             start_ts=effective_start,
             end_ts=end_ts,
@@ -46,6 +55,9 @@ async def ingest_trades_for_market(
                     await db.insert_trades(filtered, conn=conn)
                     await db.upsert_cursor(market_id, new_cursor, conn=conn)
             current_cursor = new_cursor
+        elif request_cursor is not None and next_cursor == request_cursor:
+            # Defensive guard: stop when API keeps returning the same cursor page.
+            break
         if not page or not next_cursor:
             break
 
