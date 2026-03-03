@@ -20,6 +20,14 @@ from zoneinfo import ZoneInfo
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 _REPO_ROOT = os.path.abspath(os.path.join(_SCRIPT_DIR, os.pardir, os.pardir))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
+from master_db import (  # noqa: E402
+    ensure_master_db_ready,
+    get_latest_observed_date_local,
+    upsert_station_observations,
+)
 
 
 DEFAULT_LOCATIONS_CSV = os.path.join(_REPO_ROOT, "locations.csv")
@@ -27,7 +35,7 @@ DEFAULT_OUTPUT_DIR = os.path.join(_REPO_ROOT, "data", "observations")
 DEFAULT_UNITS = "e"  # English/Imperial units from weather.com APIs (temp=F, precip=in)
 DEFAULT_CHUNK_DAYS = 30
 DEFAULT_BOOTSTRAP_DAYS = 30
-DEFAULT_OUTPUT_FORMAT = "parquet"  # parquet|jsonl
+DEFAULT_OUTPUT_FORMAT = "db"  # db|jsonl|parquet (parquet is deprecated alias for db)
 DEFAULT_RETRIES = 3
 DEFAULT_RETRY_BACKOFF_S = 1.0
 
@@ -215,17 +223,24 @@ def parse_station_from_wunderground_url(
 def load_stations(locations_csv_path: str) -> list[Station]:
     stations: list[Station] = []
     with open(locations_csv_path, newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
+        reader = csv.DictReader(f, skipinitialspace=True)
+        for row_number, row in enumerate(reader, start=2):
             name = (row.get("name") or "").strip()
             url = (row.get("url") or "").strip()
             lat_lon = (row.get("lat_lon") or "").strip()
             timezone = (row.get("timezone") or "").strip()
             if not name or not url:
                 continue
-            stations.append(
-                parse_station_from_wunderground_url(name=name, url=url, lat_lon=lat_lon, timezone=timezone)
-            )
+            try:
+                stations.append(
+                    parse_station_from_wunderground_url(name=name, url=url, lat_lon=lat_lon, timezone=timezone)
+                )
+            except Exception as exc:
+                _log(
+                    f"Skipping invalid station row {row_number} in {locations_csv_path}: "
+                    f"name={name!r} url={url!r} ({type(exc).__name__}: {exc})"
+                )
+                continue
     if not stations:
         raise RuntimeError(f"No stations found in {locations_csv_path}")
     return stations
@@ -434,33 +449,8 @@ def write_parquet_records(records: list[dict[str, Any]], path: str) -> None:
     pq.write_table(table, path, compression="zstd")
 
 
-def upsert_station_records(*, output_path: str, new_records: list[dict[str, Any]]) -> int:
-    if not new_records:
-        return 0
-
-    _require_pyarrow()
-    existing_records = load_existing_parquet_records(output_path) or []
-
-    by_time: dict[str, dict[str, Any]] = {}
-    for record in existing_records:
-        normalized = _normalize_record(record)
-        if normalized is None:
-            continue
-        by_time[normalized["observed_at_local"]] = normalized
-
-    inserted = 0
-    for record in new_records:
-        normalized = _normalize_record(record)
-        if normalized is None:
-            continue
-        key = normalized["observed_at_local"]
-        if key not in by_time:
-            inserted += 1
-        by_time[key] = normalized
-
-    combined = [by_time[k] for k in sorted(by_time.keys())]
-    write_parquet_records(combined, output_path)
-    return inserted
+def upsert_station_records(*, new_records: list[dict[str, Any]], master_dsn: str) -> dict[str, int]:
+    return upsert_station_observations(records=new_records, master_dsn=master_dsn)
 
 
 def upsert_station_records_jsonl(*, output_path: str, new_records: list[dict[str, Any]]) -> int:
@@ -540,9 +530,12 @@ def _latest_observed_date_local_jsonl(output_path: str) -> Optional[dt.date]:
 
 def _normalize_output_format(value: str) -> str:
     value = (value or "").strip().lower()
-    if value in {"parquet", "jsonl"}:
+    if value == "parquet":
+        _log("--format parquet is deprecated; using database mode instead.")
+        return "db"
+    if value in {"db", "jsonl"}:
         return value
-    raise ValueError("--format must be one of: parquet, jsonl")
+    raise ValueError("--format must be one of: db, jsonl (parquet is accepted as alias for db)")
 
 
 def scrape_once(
@@ -556,24 +549,32 @@ def scrape_once(
     timeout_s: int,
     dry_run: bool,
     output_format: str,
+    master_dsn: Optional[str],
     retries: int,
     retry_backoff_s: float,
     fail_fast: bool,
 ) -> None:
     output_format = _normalize_output_format(output_format)
+    resolved_master_dsn: Optional[str] = None
+    if output_format == "db" and not dry_run:
+        resolved_master_dsn = ensure_master_db_ready(master_dsn=master_dsn)
+
+    shared_api_key: Optional[str] = None
+    shared_api_key_station: Optional[str] = None
     for station in stations:
         try:
             include_precip = station.name.strip().casefold() == "nyc"
             base_path = _infer_station_output_path(output_dir, station)
-            output_path = base_path + (".parquet" if output_format == "parquet" else ".jsonl")
+            output_path = base_path + ".jsonl"
+            output_target = "master_db.station_observations" if output_format == "db" else output_path
 
             if start_date is None:
                 if dry_run:
                     latest = None
                 else:
                     latest = (
-                        _latest_observed_date_local_parquet(output_path)
-                        if output_format == "parquet"
+                        get_latest_observed_date_local(station.name, master_dsn=resolved_master_dsn)
+                        if output_format == "db"
                         else _latest_observed_date_local_jsonl(output_path)
                     )
                 if latest is None:
@@ -585,13 +586,7 @@ def scrape_once(
 
             station_start = min(station_start, end_date)
 
-            html = http_get_text(
-                station.url,
-                timeout_s=timeout_s,
-                retries=retries,
-                retry_backoff_s=retry_backoff_s,
-            )
-            api_key = extract_weather_com_api_key(html)
+            html: Optional[str] = None
             tzinfo: dt.tzinfo | None = None
             wu_timezone: Optional[str] = None
             if station.timezone:
@@ -603,8 +598,54 @@ def scrape_once(
                         f"({type(exc).__name__}: {exc}); falling back to Wunderground"
                     )
                     tzinfo = None
+            need_station_page = (shared_api_key is None) or (tzinfo is None)
+            if need_station_page:
+                try:
+                    html = http_get_text(
+                        station.url,
+                        timeout_s=timeout_s,
+                        retries=retries,
+                        retry_backoff_s=retry_backoff_s,
+                    )
+                except Exception as exc:
+                    if shared_api_key is None:
+                        raise RuntimeError(
+                            f"Could not fetch station page for API key discovery: {station.url}"
+                        ) from exc
+                    _log(
+                        f"{station.name}: failed fetching station page "
+                        f"({type(exc).__name__}: {exc}); using cached API key from "
+                        f"{shared_api_key_station or 'previous station'}"
+                    )
+
+            station_api_key: Optional[str] = None
+            if html is not None:
+                try:
+                    station_api_key = extract_weather_com_api_key(html)
+                except Exception as exc:
+                    if shared_api_key is None:
+                        raise RuntimeError(
+                            f"Could not extract weather.com api key from {station.url}"
+                        ) from exc
+                    _log(
+                        f"{station.name}: failed to extract weather.com api key "
+                        f"({type(exc).__name__}: {exc}); using cached key from "
+                        f"{shared_api_key_station or 'previous station'}"
+                    )
+
+            if station_api_key:
+                api_key = station_api_key
+                if shared_api_key is None:
+                    shared_api_key = station_api_key
+                    shared_api_key_station = station.name
+            elif shared_api_key is not None:
+                api_key = shared_api_key
+            else:
+                raise RuntimeError("No weather.com api key available")
+
             try:
-                wu_timezone = extract_iana_timezone(html)
+                if html is not None:
+                    wu_timezone = extract_iana_timezone(html)
             except Exception as exc:
                 wu_timezone = None
                 _log(
@@ -631,7 +672,9 @@ def scrape_once(
                 )
 
             scraped_at = _utcnow()
-            total_new = 0
+            total_inserted = 0
+            total_updated = 0
+            total_unchanged = 0
             buffered: list[dict[str, Any]] = []
             for chunk_start, chunk_end in iter_date_chunks(station_start, end_date, chunk_days=chunk_days):
                 try:
@@ -663,11 +706,14 @@ def scrape_once(
                 if dry_run:
                     buffered.extend(records)
                 else:
-                    if output_format == "parquet":
-                        inserted = upsert_station_records(output_path=output_path, new_records=records)
+                    if output_format == "db":
+                        stats = upsert_station_records(new_records=records, master_dsn=resolved_master_dsn or "")
+                        total_inserted += stats["inserted"]
+                        total_updated += stats["updated"]
+                        total_unchanged += stats["unchanged"]
                     else:
                         inserted = upsert_station_records_jsonl(output_path=output_path, new_records=records)
-                    total_new += inserted
+                        total_inserted += inserted
                 _sleep_seconds(throttle_s)
 
             if dry_run:
@@ -675,7 +721,13 @@ def scrape_once(
                 sample = buffered[-1] if buffered else None
                 print(f"{station.name}: scraped {len(unique)} unique timestamps (dry-run). sample={sample}")
             else:
-                print(f"{station.name}: added {total_new} new rows to {output_path}")
+                if output_format == "db":
+                    print(
+                        f"{station.name}: inserted={total_inserted} updated={total_updated} "
+                        f"unchanged={total_unchanged} into {output_target}"
+                    )
+                else:
+                    print(f"{station.name}: added {total_inserted} new rows to {output_target}")
         except Exception as exc:
             _log(f"{station.name}: failed ({type(exc).__name__}: {exc}); skipping station")
             if fail_fast:
@@ -685,12 +737,12 @@ def scrape_once(
 def main() -> int:
     parser = argparse.ArgumentParser(
         description=(
-            "Scrape Wunderground-backed weather.com observations into per-station parquet files "
-            "under data/observations/."
+            "Scrape Wunderground-backed weather.com observations into master_db.station_observations "
+            "(or JSONL if requested)."
         )
     )
     parser.add_argument("--locations", default=DEFAULT_LOCATIONS_CSV, help="Path to locations.csv")
-    parser.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR, help="Output directory for parquet files")
+    parser.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR, help="Output directory for jsonl files")
     parser.add_argument(
         "--start-date",
         type=_parse_yyyy_mm_dd,
@@ -710,7 +762,12 @@ def main() -> int:
     parser.add_argument(
         "--format",
         default=DEFAULT_OUTPUT_FORMAT,
-        help="Output format: parquet (default, requires working pyarrow) or jsonl",
+        help="Output format: db (default), jsonl, or deprecated parquet alias (mapped to db).",
+    )
+    parser.add_argument(
+        "--master-dsn",
+        default=None,
+        help="Optional DSN for master_db (defaults to MASTER_POSTGRES_DSN or config-derived value).",
     )
     parser.add_argument("--retries", type=int, default=DEFAULT_RETRIES, help="HTTP retry attempts on timeouts/5xx")
     parser.add_argument(
@@ -766,6 +823,7 @@ def main() -> int:
             timeout_s=args.timeout_s,
             dry_run=args.dry_run,
             output_format=args.format,
+            master_dsn=args.master_dsn,
             retries=args.retries,
             retry_backoff_s=args.retry_backoff_s,
             fail_fast=args.fail_fast,

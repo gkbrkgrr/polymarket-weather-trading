@@ -4,22 +4,22 @@ This repo's `locations.csv` contains Wunderground daily-history URLs for each st
 
 - discover the `apiKey` embedded in the page HTML
 - fetch historical observations from `api.weather.com`
-- store per-station archives under `data/observations/` (one file per station)
+- upsert rows into `master_db.station_observations`
 
 Defaults are computed relative to the repo root, so you can run the script from any working directory.
 
 ### Output format
 
-- Default: `parquet` (requires a working `pyarrow` installation).
+- Default: `db` (writes to PostgreSQL table `station_observations` in `master_db`).
 - Optional: `jsonl` (no extra dependencies, works in constrained environments).
 
-### Parquet dependency
+### Optional Parquet dependency
 
 ```bash
 python -m pip install "pyarrow>=14"
 ```
 
-### Backfill an archive
+### Backfill observations into DB
 
 ```bash
 python data_gatherer/observations_scraper.py --start-date 2026-01-01
@@ -33,7 +33,7 @@ python data_gatherer/observations_scraper.py --start-date 2026-01-01 --format js
 
 ### Incremental updates (run every 30 minutes)
 
-The scraper is idempotent: if a station archive already exists (`.jsonl` or `.parquet`), it automatically re-scrapes from the last stored timestamp (with a 1-day safety window) and appends any new observations.
+The scraper is idempotent: it automatically re-scrapes from the last stored timestamp in DB (with a 1-day safety window) and performs a conflict-safe upsert.
 
 ```bash
 python data_gatherer/observations_scraper.py
