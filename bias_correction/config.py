@@ -31,6 +31,7 @@ class BiasCorrectionConfig:
     models: list[str] | None
     output_suffix: str
     obs_source_path: Path | None
+    obs_source_dsn: str | None
     intermediate_dir: Path
     artifacts_root: Path
     reuse_intermediate: bool
@@ -71,6 +72,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "models": None,
     "output_suffix": "_biascorrected",
     "obs_source_path": None,
+    "obs_source_dsn": None,
     "intermediate_dir": "bias_correction/intermediate",
     "artifacts_root": "bias_correction/artifacts",
     "reuse_intermediate": True,
@@ -140,6 +142,8 @@ def build_config(
         if not obs_path.is_absolute():
             obs_path = (repo_root / obs_path).resolve()
         data["obs_source_path"] = obs_path
+    if data.get("obs_source_dsn") is not None:
+        data["obs_source_dsn"] = str(data["obs_source_dsn"]).strip()
 
     data["models"] = parse_models(data.get("models"))
     data["n_jobs"] = int(data["n_jobs"])
@@ -178,6 +182,7 @@ def build_config(
         models=data["models"],
         output_suffix=str(data["output_suffix"]),
         obs_source_path=data.get("obs_source_path"),
+        obs_source_dsn=data.get("obs_source_dsn"),
         intermediate_dir=data["intermediate_dir"],
         artifacts_root=data["artifacts_root"],
         reuse_intermediate=data["reuse_intermediate"],

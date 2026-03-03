@@ -1,9 +1,16 @@
 from __future__ import annotations
 
 from pathlib import Path
+import sys
 
 import numpy as np
 import pandas as pd
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from master_db import get_daily_tmax_by_station, resolve_master_postgres_dsn
 
 
 OBS_CITY_ALIASES = ("city", "city_name")
@@ -128,43 +135,35 @@ def _normalize_obs_frame(
 def load_observation_daily(
     *,
     obs_source_path: Path | None,
+    obs_source_dsn: str | None,
     logger,
 ) -> pd.DataFrame | None:
-    if obs_source_path is None:
-        return None
-    if not obs_source_path.exists():
-        raise FileNotFoundError(f"obs_source_path not found: {obs_source_path}")
-
-    frames: list[pd.DataFrame] = []
-    if obs_source_path.is_dir():
-        files = sorted(obs_source_path.glob("*.parquet"))
+    if obs_source_path is not None:
         logger.info(
-            "Loading external observations from directory: %s (%d files)",
+            "obs_source_path is deprecated (%s). Reading observations from DB table station_observations.",
             obs_source_path,
-            len(files),
         )
-        for path in files:
-            df_obs = pd.read_parquet(path)
-            city_hint = path.stem
-            normalized = _normalize_obs_frame(df=df_obs, city_hint=city_hint, source_path=path)
-            if not normalized.empty:
-                frames.append(normalized)
-    else:
-        logger.info("Loading external observations from file: %s", obs_source_path)
-        df_obs = pd.read_parquet(obs_source_path)
-        normalized = _normalize_obs_frame(
-            df=df_obs,
-            city_hint="",
-            source_path=obs_source_path,
-        )
-        if not normalized.empty:
-            frames.append(normalized)
 
-    if not frames:
-        logger.warning("No external observations were parsed from %s", obs_source_path)
+    dsn = resolve_master_postgres_dsn(explicit_dsn=obs_source_dsn)
+    logger.info("Loading external observations from DB station_observations")
+    rows = get_daily_tmax_by_station(master_dsn=dsn)
+    if rows.empty:
+        logger.warning("No external observations were found in station_observations")
         return None
 
-    all_obs = pd.concat(frames, ignore_index=True)
+    all_obs = pd.DataFrame(
+        {
+            "city": rows["city_name"].astype("string"),
+            "station_name": rows["city_name"].astype("string"),
+            "target_date": pd.to_datetime(rows["target_date_local"], errors="coerce").dt.normalize(),
+            "tmax_obs_external": pd.to_numeric(rows["tmax_obs_c"], errors="coerce"),
+        }
+    )
+    all_obs = all_obs.dropna(subset=["city", "station_name", "target_date", "tmax_obs_external"]).copy()
+    if all_obs.empty:
+        logger.warning("No external observations were parsed from station_observations")
+        return None
+
     all_obs = (
         all_obs.groupby(["city", "station_name", "target_date"], as_index=False)["tmax_obs_external"]
         .max()

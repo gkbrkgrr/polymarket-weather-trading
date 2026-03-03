@@ -8,7 +8,7 @@ Expected input layout:
 - Station metadata:
   stations.csv (preferred) or locations.csv (fallback for this repository)
 - Observations:
-  data/observations/<city_name>.parquet
+  master_db.station_observations
 
 Timestamp derivation for file naming:
 - For each cycle directory, first/last timestamps in output filename are taken
@@ -64,6 +64,11 @@ except ImportError as exc:  # pragma: no cover - import guard
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from master_db import get_daily_tmax_by_station, resolve_master_postgres_dsn
+
 DEFAULT_ARCHIVE_ROOT = (
     REPO_ROOT / "data" / "raster_data" / "gfs_archive"
 )
@@ -97,12 +102,16 @@ OUTPUT_COLUMNS = [
     "target_date_local",
     "tmax_time_utc",
     "lead_time_hours",
+    "issue_hour_utc_sin",
+    "issue_hour_utc_cos",
     "tmax_obs_c",
     "tmax_raw_c",
     "tcc_mean_pct",
     "tcc_max_pct",
+    "tcc_at_tmax_pct",
     "ws10_mean_mps",
     "ws10_max_mps",
+    "ws10_at_tmax_mps",
     "td2m_mean_c",
     "td2m_at_tmax_c",
     "rh2m_at_tmax_c",
@@ -222,7 +231,7 @@ def load_stations(stations_csv: Path, logger: logging.Logger) -> list[Station]:
                 continue
             lat = float(row[lat_col])
             lon = float(row[lon_col])
-            elev_ft = float(row[elev_col])
+            elev_m = float(row[elev_col])
             tz_file = str(row[tz_col]).strip() if tz_col and pd.notna(row[tz_col]) else ""
             tz_map = CITY_TIMEZONE_MAP.get(city, "")
             tz = tz_file or tz_map
@@ -240,7 +249,7 @@ def load_stations(stations_csv: Path, logger: logging.Logger) -> list[Station]:
                     city_name=city,
                     station_lat=lat,
                     station_lon=lon,
-                    station_elev_m=elev_ft * 0.3048,
+                    station_elev_m=elev_m,
                     local_timezone=tz,
                 )
             )
@@ -254,7 +263,7 @@ def load_stations(stations_csv: Path, logger: logging.Logger) -> list[Station]:
             if not city:
                 continue
             lat, lon = parse_lat_lon_compact(str(row[latlon_col]))
-            elev_ft = float(row[elev_col])
+            elev_m = float(row[elev_col])
             tz_file = str(row[tz_col]).strip() if tz_col and pd.notna(row[tz_col]) else ""
             tz_map = CITY_TIMEZONE_MAP.get(city, "")
             tz = tz_file or tz_map
@@ -272,7 +281,7 @@ def load_stations(stations_csv: Path, logger: logging.Logger) -> list[Station]:
                     city_name=city,
                     station_lat=lat,
                     station_lon=lon,
-                    station_elev_m=elev_ft * 0.3048,
+                    station_elev_m=elev_m,
                     local_timezone=tz,
                 )
             )
@@ -393,48 +402,20 @@ def load_obs(
     obs_root: Path,
     local_timezone: str,
     logger: logging.Logger,
+    obs_dsn: str | None = None,
 ) -> pd.DataFrame:
-    exact = obs_root / f"{city_name}.parquet"
-    obs_path: Path | None = exact if exact.exists() else None
-    if obs_path is None:
-        city_l = city_name.lower()
-        for cand in obs_root.glob("*.parquet"):
-            if cand.stem.lower() == city_l:
-                obs_path = cand
-                break
-    if obs_path is None:
-        logger.warning("Observation file missing for city=%s under %s", city_name, obs_root)
+    del obs_root, local_timezone
+    dsn = resolve_master_postgres_dsn(explicit_dsn=obs_dsn)
+    out = get_daily_tmax_by_station(stations=[city_name], master_dsn=dsn)
+    if out.empty:
+        logger.warning("Observation rows missing for city=%s in station_observations", city_name)
         return pd.DataFrame({"city_name": [], "target_date_local": [], "tmax_obs_c": []})
 
-    df = pd.read_parquet(obs_path)
-    if df.empty:
-        return pd.DataFrame({"city_name": [], "target_date_local": [], "tmax_obs_c": []})
-
-    ts_col = detect_observation_time_column(df)
-    temp_c = detect_temperature_celsius(df, city_name, logger)
-    obs_utc = parse_observation_times_to_utc(
-        df[ts_col],
-        city_name=city_name,
-        local_timezone=local_timezone,
-        column_name=ts_col,
-        logger=logger,
-    )
-    local_ts = obs_utc.dt.tz_convert(local_timezone)
-    target_date_local = local_ts.dt.date
-
-    out = pd.DataFrame(
-        {
-            "city_name": city_name,
-            "target_date_local": target_date_local,
-            "temperature_c": temp_c,
-        }
-    )
-    out = out.dropna(subset=["target_date_local", "temperature_c"])
-    out = (
-        out.groupby(["city_name", "target_date_local"], as_index=False)["temperature_c"]
-        .max()
-        .rename(columns={"temperature_c": "tmax_obs_c"})
-    )
+    out = out.rename(columns={"city_name": "city_name", "target_date_local": "target_date_local"})
+    out["city_name"] = city_name
+    out["target_date_local"] = pd.to_datetime(out["target_date_local"], errors="coerce").dt.date
+    out["tmax_obs_c"] = pd.to_numeric(out["tmax_obs_c"], errors="coerce")
+    out = out.dropna(subset=["target_date_local", "tmax_obs_c"]).copy()
     return out
 
 
@@ -1036,6 +1017,12 @@ def compute_daily_features(
     rows: list[dict[str, object]] = []
     tcc_units = [x[3] for x in used_meta.get("tcc", set())]
     rh_units = [x[3] for x in used_meta.get("rh2m", set())]
+    issue_hour_utc = (
+        float(issue_time_utc.astimezone(timezone.utc).hour)
+        + float(issue_time_utc.astimezone(timezone.utc).minute) / 60.0
+    )
+    issue_hour_utc_sin = math.sin(2.0 * math.pi * issue_hour_utc / 24.0)
+    issue_hour_utc_cos = math.cos(2.0 * math.pi * issue_hour_utc / 24.0)
 
     for city_name, city_df in instant_wide.groupby("city_name", sort=False):
         st = station_map.get(city_name)
@@ -1090,6 +1077,8 @@ def compute_daily_features(
                 lead_time_hours = float("nan")
                 td2m_at_tmax_c = float("nan")
                 rh2m_at_tmax_c = float("nan")
+                tcc_at_tmax_pct = float("nan")
+                ws10_at_tmax_mps = float("nan")
             else:
                 tmax_idx = t2m_vals.idxmax(skipna=True)
                 tmax_raw_c = float(day_df.loc[tmax_idx, "t2m_c"])
@@ -1106,6 +1095,8 @@ def compute_daily_features(
                     )
                 else:
                     rh2m_at_tmax_c = float(np.clip(rh_raw, 0.0, 100.0))
+                tcc_at_tmax_pct = float(pd.to_numeric(day_df.loc[tmax_idx, "tcc_pct"], errors="coerce"))
+                ws10_at_tmax_mps = float(pd.to_numeric(day_df.loc[tmax_idx, "ws10_mps"], errors="coerce"))
 
             tmin = float(t2m_vals.min(skipna=True)) if not t2m_vals.dropna().empty else float("nan")
             tmax = float(t2m_vals.max(skipna=True)) if not t2m_vals.dropna().empty else float("nan")
@@ -1130,12 +1121,16 @@ def compute_daily_features(
                 "target_date_local": d,
                 "tmax_time_utc": tmax_time_utc,
                 "lead_time_hours": float(lead_time_hours),
+                "issue_hour_utc_sin": float(issue_hour_utc_sin),
+                "issue_hour_utc_cos": float(issue_hour_utc_cos),
                 "tmax_obs_c": obs_map.get(d, float("nan")),
                 "tmax_raw_c": float(tmax_raw_c),
                 "tcc_mean_pct": float(pd.to_numeric(day_df["tcc_pct"], errors="coerce").mean(skipna=True)),
                 "tcc_max_pct": float(pd.to_numeric(day_df["tcc_pct"], errors="coerce").max(skipna=True)),
+                "tcc_at_tmax_pct": float(tcc_at_tmax_pct),
                 "ws10_mean_mps": float(pd.to_numeric(day_df["ws10_mps"], errors="coerce").mean(skipna=True)),
                 "ws10_max_mps": float(pd.to_numeric(day_df["ws10_mps"], errors="coerce").max(skipna=True)),
+                "ws10_at_tmax_mps": float(ws10_at_tmax_mps),
                 "td2m_mean_c": float(pd.to_numeric(day_df["td2m_c"], errors="coerce").mean(skipna=True)),
                 "td2m_at_tmax_c": float(td2m_at_tmax_c),
                 "rh2m_at_tmax_c": float(rh2m_at_tmax_c),
@@ -1257,6 +1252,7 @@ def process_cycle_chunk(
     cycle_dirs: list[str],
     stations_csv: str,
     obs_root: str,
+    obs_dsn: str | None,
     train_root: str,
     base_log_file: str,
 ) -> dict[str, object]:
@@ -1276,6 +1272,7 @@ def process_cycle_chunk(
             obs_root=Path(obs_root),
             local_timezone=st.local_timezone,
             logger=logger,
+            obs_dsn=obs_dsn,
         )
 
     failures = 0
@@ -1372,7 +1369,16 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--end", required=True, help="End cycle inclusive, YYYYMMDDHH")
     p.add_argument("--archive-root", default=str(DEFAULT_ARCHIVE_ROOT))
     p.add_argument("--stations-csv", default=str(DEFAULT_STATIONS_CSV))
-    p.add_argument("--obs-root", default=str(DEFAULT_OBS_ROOT))
+    p.add_argument(
+        "--obs-root",
+        default=str(DEFAULT_OBS_ROOT),
+        help="Deprecated (observations now read from DB); kept for compatibility.",
+    )
+    p.add_argument(
+        "--obs-dsn",
+        default=None,
+        help="Optional DSN for master_db observation reads (defaults to MASTER_POSTGRES_DSN/config-derived value).",
+    )
     p.add_argument("--train-root", default=str(DEFAULT_TRAIN_ROOT))
     p.add_argument("--log-file", default=str(DEFAULT_LOG_PATH))
     p.add_argument(
@@ -1402,12 +1408,11 @@ def main(argv: list[str]) -> int:
     archive_root = Path(args.archive_root).expanduser().resolve()
     stations_csv = Path(args.stations_csv).expanduser().resolve()
     obs_root = Path(args.obs_root).expanduser().resolve()
+    obs_dsn = resolve_master_postgres_dsn(explicit_dsn=args.obs_dsn)
     train_root = Path(args.train_root).expanduser().resolve()
 
     if not archive_root.exists():
         raise SystemExit(f"Archive root does not exist: {archive_root}")
-    if not obs_root.exists():
-        raise SystemExit(f"Observation root does not exist: {obs_root}")
 
     cycles = list_cycles_in_range(archive_root, args.start, args.end)
     logger.info(
@@ -1432,6 +1437,7 @@ def main(argv: list[str]) -> int:
                 obs_root=obs_root,
                 local_timezone=st.local_timezone,
                 logger=logger,
+                obs_dsn=obs_dsn,
             )
         for cycle_dir in cycles:
             try:
@@ -1470,6 +1476,7 @@ def main(argv: list[str]) -> int:
                     cycle_dirs=[str(p) for p in chunk],
                     stations_csv=str(stations_csv),
                     obs_root=str(obs_root),
+                    obs_dsn=obs_dsn,
                     train_root=str(train_root),
                     base_log_file=str(Path(args.log_file).expanduser().resolve()),
                 )

@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import re
 from pathlib import Path
+import sys
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -12,6 +13,11 @@ from matplotlib.backends.backend_pdf import PdfPages
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from master_db import get_daily_tmax_by_station, resolve_master_postgres_dsn
+
 DEFAULT_INPUT_ROOT = REPO_ROOT / "data" / "ml_predictions"
 DEFAULT_OBS_ROOT = REPO_ROOT / "data" / "observations"
 DEFAULT_OUTPUT_DIR = REPO_ROOT / "reports" / "error_heatmaps"
@@ -36,7 +42,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--obs-root",
         type=Path,
         default=DEFAULT_OBS_ROOT,
-        help=f"Directory containing city observation parquet files (default: {DEFAULT_OBS_ROOT})",
+        help=f"Deprecated (observations now read from DB); kept for compatibility (default: {DEFAULT_OBS_ROOT})",
+    )
+    parser.add_argument(
+        "--obs-dsn",
+        type=str,
+        default=None,
+        help="Optional DSN for master_db observation reads (defaults to MASTER_POSTGRES_DSN/config-derived value).",
     )
     parser.add_argument(
         "--date-prefix",
@@ -130,61 +142,15 @@ def load_model_predictions(
     return df, tokens
 
 
-def load_daily_observations(obs_root: Path) -> pd.DataFrame:
-    if not obs_root.exists():
-        raise SystemExit(f"Observation directory not found: {obs_root}")
-
-    obs_files = sorted(obs_root.glob("*.parquet"))
-    if not obs_files:
-        raise SystemExit(f"No observation parquet files found under: {obs_root}")
-
-    parts: list[pd.DataFrame] = []
-    for obs_path in obs_files:
-        city_name = obs_path.stem
-        raw = pd.read_parquet(obs_path)
-        cols = {str(c).lower(): str(c) for c in raw.columns}
-
-        if "temperature_c" in cols:
-            temp_c = pd.to_numeric(raw[cols["temperature_c"]], errors="coerce")
-        elif "temp_c" in cols:
-            temp_c = pd.to_numeric(raw[cols["temp_c"]], errors="coerce")
-        elif "temperature_f" in cols:
-            temp_f = pd.to_numeric(raw[cols["temperature_f"]], errors="coerce")
-            temp_c = (temp_f - 32.0) * (5.0 / 9.0)
-        elif "temp_f" in cols:
-            temp_f = pd.to_numeric(raw[cols["temp_f"]], errors="coerce")
-            temp_c = (temp_f - 32.0) * (5.0 / 9.0)
-        else:
-            continue
-
-        if "target_date_local" in cols:
-            target_date = pd.to_datetime(raw[cols["target_date_local"]], errors="coerce").dt.normalize()
-        elif "target_date" in cols:
-            target_date = pd.to_datetime(raw[cols["target_date"]], errors="coerce").dt.normalize()
-        elif "observed_at_local" in cols:
-            text = raw[cols["observed_at_local"]].astype("string")
-            target_date = pd.to_datetime(text.str.slice(0, 10), errors="coerce").dt.normalize()
-        else:
-            continue
-
-        city_obs = pd.DataFrame(
-            {
-                "city_name": city_name,
-                "target_date_local": target_date,
-                "observation": temp_c,
-            }
-        )
-        city_obs = city_obs.dropna(subset=["target_date_local", "observation"])
-        if city_obs.empty:
-            continue
-        daily = city_obs.groupby(["city_name", "target_date_local"], as_index=False)["observation"].max()
-        parts.append(daily)
-
-    if not parts:
-        raise SystemExit(f"No usable observation rows were parsed from: {obs_root}")
-
-    out = pd.concat(parts, ignore_index=True)
-    out = out.groupby(["city_name", "target_date_local"], as_index=False)["observation"].max()
+def load_daily_observations(obs_dsn: str | None) -> pd.DataFrame:
+    dsn = resolve_master_postgres_dsn(explicit_dsn=obs_dsn)
+    out = get_daily_tmax_by_station(master_dsn=dsn)
+    if out.empty:
+        raise SystemExit("No observation rows found in master_db.station_observations")
+    out = out.rename(columns={"tmax_obs_c": "observation"})
+    out["target_date_local"] = pd.to_datetime(out["target_date_local"], errors="coerce").dt.normalize()
+    out["observation"] = pd.to_numeric(out["observation"], errors="coerce")
+    out = out.dropna(subset=["city_name", "target_date_local", "observation"]).copy()
     return out
 
 
@@ -291,7 +257,7 @@ def main(argv: list[str] | None = None) -> int:
         all_tokens.extend(model_tokens)
 
     pred_df = pd.concat(all_frames, ignore_index=True)
-    obs_df = load_daily_observations(args.obs_root)
+    obs_df = load_daily_observations(args.obs_dsn)
 
     merged = pred_df.merge(obs_df, on=["city_name", "target_date_local"], how="left")
     merged = merged.dropna(subset=["observation"]).copy()

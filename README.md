@@ -29,7 +29,7 @@ pip install -e ".[test]"
 Set `POSTGRES_DSN` and initialize the schema:
 
 ```bash
-export POSTGRES_DSN=postgresql://archive_user:password@127.0.0.1:5432/polymarket_archive
+export POSTGRES_DSN=postgresql://archive_user:password@127.0.0.1:5432/master_db
 polymarket_archive init-db
 ```
 
@@ -54,7 +54,7 @@ Supported environment variables:
 
 Example `config.yaml`:
 ```yaml
-postgres_dsn: postgresql://archive_user:password@127.0.0.1:5432/polymarket_archive
+postgres_dsn: postgresql://archive_user:password@127.0.0.1:5432/master_db
 gamma_base_url: https://gamma-api.polymarket.com
 data_base_url: https://data-api.polymarket.com
 clob_ws_url: wss://ws-subscriptions-clob.polymarket.com/ws
@@ -111,7 +111,7 @@ Each JSONL record contains:
 ## Tests
 
 ```bash
-POSTGRES_DSN=postgresql://archive_user:password@127.0.0.1:5432/polymarket_archive pytest -q
+POSTGRES_DSN=postgresql://archive_user:password@127.0.0.1:5432/master_db pytest -q
 ```
 
 If `POSTGRES_DSN` is not set, database-backed tests are skipped.
@@ -135,7 +135,7 @@ Prediction parquet files can vary by model, but each file must be normalizable t
 - `lead_hours` (aliases: `LeadHour`, `lead_time_hours`)
 - `cycle` (derived from `issue_time_utc` hour if missing)
 - `tmax_pred` prediction (auto-detected from common names such as `tmax_pred`, `prediction`, `yhat`, `Forecast`)
-- `tmax_obs` observations (`tmax_obs`, `tmax_obs_c`, etc.) or provided via `--obs_source_path`
+- `tmax_obs` observations (`tmax_obs`, `tmax_obs_c`, etc.) or loaded from `master_db.station_observations` (override via `--obs_source_dsn`)
 
 ### Leakage-Safety Design
 
@@ -165,7 +165,7 @@ python bias_correction/run_bias_correction.py \
   --ewma_halflife_days 14 \
   --min_history 30 \
   --model_strategy "single_residual_with_model_feature" \
-  --obs_source_path "/home/gkbrkgrr/Desktop/polymarket-weather-trading/data/observations" \
+  --obs_source_dsn "postgresql://archive_user:password@127.0.0.1:5432/master_db" \
   --n_jobs 8
 ```
 
@@ -177,7 +177,7 @@ python bias_correction/run_bias_correction.py \
   --models "xgb_opt" \
   --train_start "2025010100" --train_end "2025123118" \
   --backfill_start "2026010100" --backfill_end "latest" \
-  --obs_source_path "/home/gkbrkgrr/Desktop/polymarket-weather-trading/data/observations"
+  --obs_source_dsn "postgresql://archive_user:password@127.0.0.1:5432/master_db"
 ```
 
 Dry-run discovery and write plan:

@@ -43,6 +43,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--output_suffix", type=str, default=None)
     parser.add_argument("--obs_source_path", type=str, default=None)
+    parser.add_argument("--obs_source_dsn", type=str, default=None)
     parser.add_argument("--intermediate_dir", type=str, default=None)
     parser.add_argument("--artifacts_root", type=str, default=None)
     parser.add_argument("--log_level", type=str, default=None)
@@ -87,6 +88,7 @@ def main(argv: list[str] | None = None) -> int:
         "models": args.models,
         "output_suffix": args.output_suffix,
         "obs_source_path": args.obs_source_path,
+        "obs_source_dsn": args.obs_source_dsn,
         "intermediate_dir": args.intermediate_dir,
         "artifacts_root": args.artifacts_root,
         "log_level": args.log_level,

@@ -281,7 +281,11 @@ def run_pipeline(cfg: BiasCorrectionConfig) -> dict[str, object]:
             "backfill_end": backfill_end_ts.strftime("%Y%m%d%H"),
         }
 
-    obs_daily = load_observation_daily(obs_source_path=cfg.obs_source_path, logger=logger)
+    obs_daily = load_observation_daily(
+        obs_source_path=cfg.obs_source_path,
+        obs_source_dsn=cfg.obs_source_dsn,
+        logger=logger,
+    )
 
     stage_a = StageABiasEngine(
         rolling_window_days=cfg.rolling_window_days,
