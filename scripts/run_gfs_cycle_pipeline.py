@@ -28,7 +28,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Run the per-cycle GFS pipeline in order: raw extraction, model predictions, "
-            "and forecast progression report."
+            "live market probabilities, and forecast progression report."
         )
     )
     parser.add_argument(
@@ -83,6 +83,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Print resolved cycle and commands without executing them.",
     )
+    parser.add_argument(
+        "--calibration-version",
+        type=str,
+        default="residual_oof_v1",
+        help="Calibration snapshot version passed to live_market_probabilities.py.",
+    )
     return parser.parse_args(argv)
 
 
@@ -129,6 +135,7 @@ def build_commands(
     python_bin: Path,
     repo_root: Path,
     cycle: str,
+    calibration_version: str,
     overwrite: bool,
     skip_telegram: bool,
     telegram_credentials_file: Path,
@@ -161,6 +168,17 @@ def build_commands(
         if overwrite:
             cmd.append("--overwrite")
         commands.append(cmd)
+
+    commands.append(
+        [
+            str(python_bin),
+            str(scripts_dir / "live_market_probabilities.py"),
+            "--cycle",
+            cycle,
+            "--calibration-version",
+            calibration_version,
+        ]
+    )
 
     commands.append(
         [
@@ -212,6 +230,7 @@ def main(argv: list[str] | None = None) -> int:
         python_bin=args.python_bin,
         repo_root=args.repo_root,
         cycle=cycle,
+        calibration_version=str(args.calibration_version),
         overwrite=overwrite,
         skip_telegram=bool(args.skip_telegram),
         telegram_credentials_file=args.telegram_credentials_file,
@@ -220,6 +239,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Cycle selected: {cycle}")
     print(f"Repo root: {args.repo_root}")
     print(f"Python bin: {args.python_bin}")
+    print(f"Calibration version: {args.calibration_version}")
     print(f"Overwrite predictions: {overwrite}")
     print(f"Skip Telegram: {bool(args.skip_telegram)}")
     if not args.skip_telegram:

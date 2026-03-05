@@ -41,7 +41,8 @@ from live_trading.utils_time import (
 )
 
 
-STRIKE_SUFFIX_RE = re.compile(r"-(?:neg-\d+|\d+)c$|-(?:\d+-\d+f|\d+forbelow|\d+forhigher|\d+f)$")
+STRIKE_SUFFIX_RE = re.compile(r"-(?:neg-\d+|\d+)c(?:orbelow|orhigher)?$|-(?:\d+-\d+f|\d+forbelow|\d+forhigher|\d+f)$")
+CYCLE_TOKEN_RE = re.compile(r"^\d{10}$")
 GENERIC_DIR_NAMES = {
     "reports",
     "report",
@@ -55,7 +56,7 @@ GENERIC_DIR_NAMES = {
 DEFAULT_CONFIG: dict[str, Any] = {
     "mode": "paper",
     "db_dsn": "postgresql://archive_user:password@127.0.0.1:5432/master_db",
-    "probabilities_path": "reports/probability_backtest_multi/market_level_probabilities.parquet",
+    "probabilities_path": "reports/live_probabilities",
     "output_dir": "live_trading",
     "nav_usd": 10000,
     "stations_allowlist": ["Atlanta", "Dallas", "Toronto", "Ankara", "Seattle", "SaoPaulo", "Seoul", "Chicago"],
@@ -140,6 +141,177 @@ def resolve_path(path_value: str | Path) -> Path:
     if path.is_absolute():
         return path
     return (REPO_ROOT / path).resolve()
+
+
+def _load_json_dict(path: Path) -> dict[str, Any]:
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise SystemExit(f"Manifest must be a JSON object: {path}")
+    return data
+
+
+def _manifest_status_is_success(manifest: Mapping[str, Any]) -> bool:
+    status = str(manifest.get("status", "")).strip().lower()
+    return (not status) or status == "success"
+
+
+def _extract_cycle_token(manifest_path: Path, manifest: Mapping[str, Any]) -> str | None:
+    cycle = str(manifest.get("cycle", "")).strip()
+    if CYCLE_TOKEN_RE.fullmatch(cycle):
+        return cycle
+
+    parts = manifest_path.resolve().parts
+    for idx, part in enumerate(parts):
+        if part != "cycles":
+            continue
+        if idx + 1 >= len(parts):
+            continue
+        candidate = parts[idx + 1]
+        if CYCLE_TOKEN_RE.fullmatch(candidate):
+            return candidate
+    return None
+
+
+def _manifest_generated_at_rank(manifest: Mapping[str, Any]) -> int:
+    raw = manifest.get("generated_at_utc")
+    if raw is None:
+        return -1
+    ts = pd.to_datetime(raw, utc=True, errors="coerce")
+    if pd.isna(ts):
+        return -1
+    return int(ts.value)
+
+
+def _resolve_manifest_probability_file(
+    manifest_path: Path,
+    manifest: Mapping[str, Any],
+    *,
+    root_hint: Path | None = None,
+) -> Path:
+    rel = manifest.get("probabilities_file")
+    if rel is None or not str(rel).strip():
+        raise SystemExit(f"Manifest missing probabilities_file: {manifest_path}")
+
+    rel_path = Path(str(rel).strip())
+    if rel_path.is_absolute():
+        if rel_path.exists():
+            return rel_path.resolve()
+        raise SystemExit(f"Manifest probabilities file not found: {rel_path}")
+
+    candidate_bases: list[Path] = []
+    if root_hint is not None:
+        candidate_bases.append(root_hint)
+    candidate_bases.extend(list(manifest_path.parents))
+
+    seen: set[str] = set()
+    checked: list[Path] = []
+    for base in candidate_bases:
+        candidate = (base / rel_path).resolve()
+        key = str(candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        checked.append(candidate)
+        if candidate.exists():
+            return candidate
+
+    checked_txt = ", ".join(str(p) for p in checked)
+    raise SystemExit(f"Manifest probabilities file not found: {rel_path} (checked: {checked_txt})")
+
+
+def _annotated_manifest(manifest: Mapping[str, Any], *, manifest_path: Path, source: str) -> dict[str, Any]:
+    out = dict(manifest)
+    out["_resolved_manifest_path"] = str(manifest_path.resolve())
+    out["_resolved_source"] = source
+    return out
+
+
+def _select_latest_cycle_manifest(root: Path) -> tuple[Path, dict[str, Any]] | None:
+    patterns = ("cycles/*/*/manifest.json", "cycles/*/manifest.json")
+    manifest_paths: list[Path] = []
+    seen_paths: set[str] = set()
+    for pattern in patterns:
+        for manifest_path in sorted(root.glob(pattern)):
+            key = str(manifest_path.resolve())
+            if key in seen_paths:
+                continue
+            seen_paths.add(key)
+            manifest_paths.append(manifest_path)
+
+    candidates: list[tuple[str, int, str, Path, dict[str, Any], Path]] = []
+    for manifest_path in manifest_paths:
+        try:
+            manifest = _load_json_dict(manifest_path)
+        except (SystemExit, Exception):
+            continue
+        if not _manifest_status_is_success(manifest):
+            continue
+        cycle_token = _extract_cycle_token(manifest_path, manifest)
+        if cycle_token is None:
+            continue
+        try:
+            prob_file = _resolve_manifest_probability_file(manifest_path, manifest, root_hint=root)
+        except (SystemExit, Exception):
+            continue
+
+        candidates.append(
+            (
+                cycle_token,
+                _manifest_generated_at_rank(manifest),
+                str(manifest_path.resolve()),
+                prob_file,
+                dict(manifest),
+                manifest_path,
+            )
+        )
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda row: (row[0], row[1], row[2]), reverse=True)
+    _, _, _, prob_file, manifest, manifest_path = candidates[0]
+    return prob_file, _annotated_manifest(manifest, manifest_path=manifest_path, source="cycle_scan")
+
+
+def resolve_probability_data_path(path: Path) -> tuple[Path, dict[str, Any] | None]:
+    if path.is_file():
+        if path.suffix.lower() == ".json" and "manifest" in path.name.lower():
+            manifest = _load_json_dict(path)
+            if not _manifest_status_is_success(manifest):
+                status = str(manifest.get("status", "")).strip().lower()
+                raise SystemExit(f"Manifest status is not success: {path} (status={status})")
+            resolved = _resolve_manifest_probability_file(path, manifest)
+            return resolved, _annotated_manifest(manifest, manifest_path=path, source="explicit_manifest")
+        return path, None
+
+    if path.is_dir():
+        manifest_path = path / "latest_manifest.json"
+        latest_manifest_error: str | None = None
+        if manifest_path.exists():
+            try:
+                manifest = _load_json_dict(manifest_path)
+                if not _manifest_status_is_success(manifest):
+                    status = str(manifest.get("status", "")).strip().lower()
+                    raise SystemExit(f"Manifest status is not success: {manifest_path} (status={status})")
+                resolved = _resolve_manifest_probability_file(manifest_path, manifest, root_hint=path)
+                return resolved, _annotated_manifest(manifest, manifest_path=manifest_path, source="latest_manifest")
+            except (SystemExit, Exception) as exc:
+                latest_manifest_error = str(exc)
+
+        selected = _select_latest_cycle_manifest(path)
+        if selected is not None:
+            return selected
+
+        for name in ("market_level_probabilities.parquet", "market_level_probabilities.csv"):
+            direct_file = path / name
+            if direct_file.exists():
+                return direct_file.resolve(), None
+
+        if latest_manifest_error:
+            raise SystemExit(f"No valid cycle manifest found under {path}. latest_manifest.json error: {latest_manifest_error}")
+        raise SystemExit(f"No valid cycle manifest found under {path}.")
+
+    raise SystemExit(f"Probabilities path not found: {path}")
 
 
 def setup_logger(log_path: Path, level: str) -> logging.Logger:
@@ -256,7 +428,10 @@ def standardize_probabilities(raw: pd.DataFrame) -> pd.DataFrame:
         out["mode_k"] = pd.Series([pd.NA] * len(out), dtype="Int64")
 
     out["market_id"] = out["market_id"].astype("string") if "market_id" in out.columns else pd.Series([pd.NA] * len(out), dtype="string")
-    out["event_key"] = out["slug"].astype("string").map(_derive_event_key)
+    if "event_key" in out.columns:
+        out["event_key"] = out["event_key"].astype("string").fillna(out["slug"].astype("string").map(_derive_event_key))
+    else:
+        out["event_key"] = out["slug"].astype("string").map(_derive_event_key)
     out["market_day_local"] = pd.to_datetime(out["date"], errors="coerce").dt.normalize()
 
     execution_raw = None
@@ -555,16 +730,23 @@ def run_healthcheck(cfg: dict[str, Any]) -> int:
     allowlist = [str(s).strip() for s in cfg.get("stations_allowlist", []) if str(s).strip()]
     checks.append(("station_allowlist_non_empty", bool(allowlist), f"count={len(allowlist)}"))
 
-    prob_path = resolve_path(str(cfg.get("probabilities_path")))
+    prob_root_path = resolve_path(str(cfg.get("probabilities_path")))
     try:
+        prob_path, manifest = resolve_probability_data_path(prob_root_path)
         raw = read_probability_files(prob_path)
         prob = standardize_probabilities(raw)
         latest_date = pd.to_datetime(prob["date"], errors="coerce").max()
         latest_date_txt = "none" if pd.isna(latest_date) else latest_date.date().isoformat()
         fresh = (not pd.isna(latest_date)) and (latest_date.date() >= date.today() - timedelta(days=2))
-        checks.append(("probabilities_recent", bool(fresh), f"path={prob_path} latest_date={latest_date_txt}"))
+        cycle_txt = ""
+        if manifest is not None and manifest.get("cycle") is not None:
+            cycle_txt = f" cycle={manifest.get('cycle')}"
+        manifest_txt = ""
+        if manifest is not None and manifest.get("_resolved_manifest_path") is not None:
+            manifest_txt = f" manifest={manifest.get('_resolved_manifest_path')}"
+        checks.append(("probabilities_recent", bool(fresh), f"path={prob_path}{cycle_txt}{manifest_txt} latest_date={latest_date_txt}"))
     except Exception as exc:
-        checks.append(("probabilities_recent", False, f"path={prob_path} error={exc}"))
+        checks.append(("probabilities_recent", False, f"path={prob_root_path} error={exc}"))
 
     try:
         with dbmod.connect_db(str(cfg.get("db_dsn"))) as conn:
@@ -605,9 +787,18 @@ def run_cycle(
     now = utc_now()
     jsonl_path = output_dir / "logs" / f"trades_{to_yyyymmdd(now.date())}.jsonl" if bool(cfg.get("write_jsonl_log", True)) else None
 
-    prob_path = resolve_path(str(cfg.get("probabilities_path")))
+    prob_root_path = resolve_path(str(cfg.get("probabilities_path")))
+    prob_path, manifest = resolve_probability_data_path(prob_root_path)
     raw_prob = read_probability_files(prob_path)
     prob = standardize_probabilities(raw_prob)
+    if manifest is not None:
+        logger.info(
+            "Using probabilities manifest source=%s cycle=%s manifest=%s file=%s",
+            manifest.get("_resolved_source"),
+            manifest.get("cycle"),
+            manifest.get("_resolved_manifest_path"),
+            prob_path,
+        )
 
     stations = [str(s).strip() for s in cfg.get("stations_allowlist", []) if str(s).strip()]
     station_tz = build_station_timezone_map(cfg, stations)

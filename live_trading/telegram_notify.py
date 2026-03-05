@@ -11,6 +11,8 @@ import httpx
 
 TOPIC_LINK_RE = re.compile(r"^https?://t\.me/c/(\d+)/(\d+)(?:/\d+)?/?$")
 SLUG_EXACT_C_RE = re.compile(r"-(neg-\d+|\d+)c$")
+SLUG_BELOW_C_RE = re.compile(r"-(neg-\d+|\d+)corbelow$")
+SLUG_ABOVE_C_RE = re.compile(r"-(neg-\d+|\d+)corhigher$")
 SLUG_EXACT_F_RE = re.compile(r"-(\d+)f$")
 SLUG_RANGE_F_RE = re.compile(r"-(\d+)-(\d+)f$")
 SLUG_BELOW_F_RE = re.compile(r"-(\d+)forbelow$")
@@ -77,6 +79,18 @@ def _parse_market_suffix(slug: str | None, fallback_strike_k: Any) -> str:
         if fallback_strike_k is None:
             return "Unknown strike"
         return f"{fallback_strike_k} \N{DEGREE SIGN}C"
+
+    m_below_c = SLUG_BELOW_C_RE.search(slug)
+    if m_below_c:
+        token = m_below_c.group(1)
+        strike = -int(token.split("-", 1)[1]) if token.startswith("neg-") else int(token)
+        return f"\N{LESS-THAN OR EQUAL TO} {strike} \N{DEGREE SIGN}C"
+
+    m_above_c = SLUG_ABOVE_C_RE.search(slug)
+    if m_above_c:
+        token = m_above_c.group(1)
+        strike = -int(token.split("-", 1)[1]) if token.startswith("neg-") else int(token)
+        return f"\N{GREATER-THAN OR EQUAL TO} {strike} \N{DEGREE SIGN}C"
 
     m_c = SLUG_EXACT_C_RE.search(slug)
     if m_c:

@@ -1,7 +1,7 @@
 mode: paper
 
 db_dsn: postgresql://archive_user:password@127.0.0.1:5432/master_db
-probabilities_path: reports/probability_backtest_multi/market_level_probabilities.parquet
+probabilities_path: reports/live_probabilities
 output_dir: live_trading
 
 nav_usd: 250

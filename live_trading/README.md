@@ -43,6 +43,16 @@ This directory contains a production-minded, minimal scaffold for running a NO-o
 Use `env_poly` as requested, then run from repo root:
 
 ```bash
+python scripts/live_market_probabilities.py --calibration-version residual_oof_v1
+```
+
+This writes cycle-versioned artifacts under `reports/live_probabilities/cycles/<cycle>/...` and atomically updates `reports/live_probabilities/latest_manifest.json`.
+It also freezes calibration inputs under `reports/live_probabilities/calibrations/<calibration_version>/...` so reruns with the same cycle + calibration version are deterministic.
+The live pilot resolves the latest successful cycle from that manifest by default, and falls back to scanning `cycles/*/*/manifest.json` and `cycles/*/manifest.json` if `latest_manifest.json` is stale/invalid.
+
+Then run the pilot:
+
+```bash
 conda activate env_poly
 python live_trading/run_live_pilot.py --config live_trading/config.live_pilot.yaml --dry-run --once
 ```
@@ -66,7 +76,7 @@ See [`config.live_pilot.yaml`](./config.live_pilot.yaml).
 Key fields:
 - `mode`: `paper` or `live` (default `paper`)
 - `db_dsn`: master Postgres DSN
-- `probabilities_path`: precomputed probabilities file/directory
+- `probabilities_path`: precomputed probabilities file/directory (default: `reports/live_probabilities`; auto-resolves newest valid cycle from manifests)
 - `stations_allowlist`, thresholds, risk limits, execution settings, scheduling, reporting
 - `telegram_notifications`: topic links + credentials for in-process sends
 
