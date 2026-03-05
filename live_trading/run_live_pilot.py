@@ -68,7 +68,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "edge_threshold": 0.02,
     "max_no_price": 0.92,
     "max_spread": 0.05,
+    "max_probability_age_days": 2,
     "max_snapshot_age_minutes": 30,
+    "pause_on_stale_probabilities": True,
+    "pause_on_stale_snapshots": True,
     "top_n_per_event_day": 2,
     "stake_fraction": 0.005,
     "stake_cap_usd": 50,
@@ -724,6 +727,82 @@ def _should_emit_daily_report(*, cfg: dict[str, Any], state_store: PilotStateSto
     return True
 
 
+def _latest_probability_date(prob: pd.DataFrame) -> date | None:
+    if "date" not in prob.columns:
+        return None
+    latest_ts = pd.to_datetime(prob["date"], errors="coerce").max()
+    if pd.isna(latest_ts):
+        return None
+    return latest_ts.date()
+
+
+def _evaluate_runtime_health_gate(
+    *,
+    cfg: dict[str, Any],
+    prob: pd.DataFrame,
+    prob_path: Path,
+    manifest: dict[str, Any] | None,
+    conn: psycopg.Connection,
+    snapshot_info: dbmod.SnapshotTableInfo,
+    now_utc: datetime,
+) -> list[str]:
+    reasons: list[str] = []
+
+    max_prob_age_days = max(0, int(cfg.get("max_probability_age_days", 2)))
+    latest_prob_date = _latest_probability_date(prob)
+    min_allowed_date = now_utc.date() - timedelta(days=max_prob_age_days)
+    prob_fresh = latest_prob_date is not None and latest_prob_date >= min_allowed_date
+    if bool(cfg.get("pause_on_stale_probabilities", True)) and not prob_fresh:
+        cycle_txt = "" if manifest is None else str(manifest.get("cycle") or "").strip()
+        reasons.append(
+            "stale_probabilities "
+            f"path={prob_path} cycle={cycle_txt or 'unknown'} "
+            f"latest_date={latest_prob_date.isoformat() if latest_prob_date is not None else 'none'} "
+            f"max_age_days={max_prob_age_days}"
+        )
+
+    try:
+        max_ts = dbmod.fetch_snapshots_freshness(conn, snapshot_table=snapshot_info)
+        if max_ts is None:
+            if bool(cfg.get("pause_on_stale_snapshots", True)):
+                reasons.append("stale_snapshots no snapshot rows in snapshot table")
+        else:
+            age_m = max(0.0, (now_utc - max_ts).total_seconds() / 60.0)
+            limit = float(cfg.get("max_snapshot_age_minutes", 30))
+            if bool(cfg.get("pause_on_stale_snapshots", True)) and age_m > limit:
+                reasons.append(
+                    "stale_snapshots "
+                    f"table={snapshot_info.table_name} age_minutes={age_m:.1f} limit={limit:.1f}"
+                )
+    except Exception as exc:
+        if bool(cfg.get("pause_on_stale_snapshots", True)):
+            reasons.append(f"stale_snapshots table_check_error={exc.__class__.__name__}: {exc}")
+
+    return reasons
+
+
+def _build_health_gate_blocked_policy(
+    candidates: pd.DataFrame,
+    *,
+    reason_text: str,
+    station_risk_limit: float,
+    portfolio_risk_limit: float,
+) -> pd.DataFrame:
+    out = candidates.copy()
+    out["NO_true"] = 1.0 - pd.to_numeric(out["p_model"], errors="coerce")
+    out["edge"] = pd.NA
+    out["decision"] = "SKIP"
+    out["skipped_reason"] = "health_gate_blocked"
+    out["health_gate_reason"] = str(reason_text)
+    out["size"] = 0.0
+    out["stake_usd"] = 0.0
+    out["risk_used_station_today"] = 0.0
+    out["risk_limit_station_today"] = float(station_risk_limit)
+    out["risk_used_portfolio_today"] = 0.0
+    out["risk_limit_portfolio_today"] = float(portfolio_risk_limit)
+    return out
+
+
 def run_healthcheck(cfg: dict[str, Any]) -> int:
     checks: list[tuple[str, bool, str]] = []
 
@@ -735,16 +814,23 @@ def run_healthcheck(cfg: dict[str, Any]) -> int:
         prob_path, manifest = resolve_probability_data_path(prob_root_path)
         raw = read_probability_files(prob_path)
         prob = standardize_probabilities(raw)
-        latest_date = pd.to_datetime(prob["date"], errors="coerce").max()
-        latest_date_txt = "none" if pd.isna(latest_date) else latest_date.date().isoformat()
-        fresh = (not pd.isna(latest_date)) and (latest_date.date() >= date.today() - timedelta(days=2))
+        latest_date = _latest_probability_date(prob)
+        latest_date_txt = "none" if latest_date is None else latest_date.isoformat()
+        max_prob_age_days = max(0, int(cfg.get("max_probability_age_days", 2)))
+        fresh = latest_date is not None and latest_date >= utc_now().date() - timedelta(days=max_prob_age_days)
         cycle_txt = ""
         if manifest is not None and manifest.get("cycle") is not None:
             cycle_txt = f" cycle={manifest.get('cycle')}"
         manifest_txt = ""
         if manifest is not None and manifest.get("_resolved_manifest_path") is not None:
             manifest_txt = f" manifest={manifest.get('_resolved_manifest_path')}"
-        checks.append(("probabilities_recent", bool(fresh), f"path={prob_path}{cycle_txt}{manifest_txt} latest_date={latest_date_txt}"))
+        checks.append(
+            (
+                "probabilities_recent",
+                bool(fresh),
+                f"path={prob_path}{cycle_txt}{manifest_txt} latest_date={latest_date_txt} max_age_days={max_prob_age_days}",
+            )
+        )
     except Exception as exc:
         checks.append(("probabilities_recent", False, f"path={prob_root_path} error={exc}"))
 
@@ -799,6 +885,26 @@ def run_cycle(
             manifest.get("_resolved_manifest_path"),
             prob_path,
         )
+
+    gate_reasons = _evaluate_runtime_health_gate(
+        cfg=cfg,
+        prob=prob,
+        prob_path=prob_path,
+        manifest=manifest,
+        conn=conn,
+        snapshot_info=snapshot_info,
+        now_utc=now,
+    )
+    health_gate_blocked = bool(gate_reasons)
+    health_gate_reason_text = "; ".join(gate_reasons)
+    if health_gate_blocked:
+        logger.error("Trading paused by health gate: %s", health_gate_reason_text)
+        if notifier is not None:
+            notifier.notify_alert(
+                f"Live pilot paused: {health_gate_reason_text}",
+                logger=logger,
+                channel="trades",
+            )
 
     stations = [str(s).strip() for s in cfg.get("stations_allowlist", []) if str(s).strip()]
     station_tz = build_station_timezone_map(cfg, stations)
@@ -895,31 +1001,40 @@ def run_cycle(
         logger.info("No candidates generated")
         return
 
-    policy_ctx = PolicyContext(
-        nav_usd=float(state_store.nav_usd),
-        mode_distance_min=int(cfg.get("mode_distance_min", 2)),
-        p_model_max=float(cfg.get("p_model_max", 0.12)),
-        edge_threshold=float(cfg.get("edge_threshold", 0.02)),
-        max_no_price=float(cfg.get("max_no_price", 0.92)),
-        top_n_per_event_day=int(cfg.get("top_n_per_event_day", 2)),
-        stake_fraction=float(cfg.get("stake_fraction", 0.005)),
-        stake_cap_usd=float(cfg.get("stake_cap_usd", 50)),
-        min_order_size=float(cfg.get("min_order_size", 1)),
-        station_daily_risk_fraction=float(cfg.get("station_daily_risk_fraction", 0.02)),
-        portfolio_daily_risk_fraction=float(cfg.get("portfolio_daily_risk_fraction", 0.05)),
-        max_open_positions_per_station=int(cfg.get("max_open_positions_per_station", 4)),
-        max_open_positions_total=int(cfg.get("max_open_positions_total", 20)),
-        trade_window_start_local=str(cfg.get("trade_window", {}).get("start_local", "00:00")),
-        trade_window_end_local=str(cfg.get("trade_window", {}).get("end_local", "12:00")),
-    )
+    if health_gate_blocked:
+        nav_usd = float(state_store.nav_usd)
+        policy_out = _build_health_gate_blocked_policy(
+            candidates,
+            reason_text=health_gate_reason_text,
+            station_risk_limit=nav_usd * float(cfg.get("station_daily_risk_fraction", 0.02)),
+            portfolio_risk_limit=nav_usd * float(cfg.get("portfolio_daily_risk_fraction", 0.05)),
+        )
+    else:
+        policy_ctx = PolicyContext(
+            nav_usd=float(state_store.nav_usd),
+            mode_distance_min=int(cfg.get("mode_distance_min", 2)),
+            p_model_max=float(cfg.get("p_model_max", 0.12)),
+            edge_threshold=float(cfg.get("edge_threshold", 0.02)),
+            max_no_price=float(cfg.get("max_no_price", 0.92)),
+            top_n_per_event_day=int(cfg.get("top_n_per_event_day", 2)),
+            stake_fraction=float(cfg.get("stake_fraction", 0.005)),
+            stake_cap_usd=float(cfg.get("stake_cap_usd", 50)),
+            min_order_size=float(cfg.get("min_order_size", 1)),
+            station_daily_risk_fraction=float(cfg.get("station_daily_risk_fraction", 0.02)),
+            portfolio_daily_risk_fraction=float(cfg.get("portfolio_daily_risk_fraction", 0.05)),
+            max_open_positions_per_station=int(cfg.get("max_open_positions_per_station", 4)),
+            max_open_positions_total=int(cfg.get("max_open_positions_total", 20)),
+            trade_window_start_local=str(cfg.get("trade_window", {}).get("start_local", "00:00")),
+            trade_window_end_local=str(cfg.get("trade_window", {}).get("end_local", "12:00")),
+        )
 
-    policy_out = apply_policy(
-        candidates=candidates,
-        state_store=state_store,
-        ctx=policy_ctx,
-        now_utc=now,
-        station_timezones=station_tz,
-    )
+        policy_out = apply_policy(
+            candidates=candidates,
+            state_store=state_store,
+            ctx=policy_ctx,
+            now_utc=now,
+            station_timezones=station_tz,
+        )
 
     mode = str(cfg.get("mode", "paper")).lower()
     if mode == "paper":

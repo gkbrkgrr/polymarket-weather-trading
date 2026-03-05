@@ -392,6 +392,36 @@ class TelegramNotifier:
         except Exception:
             logger.exception("Failed to send trade telegram message")
 
+    def notify_alert(self, message: str, *, logger: Any, channel: str = "trades") -> None:
+        if not self.enabled:
+            return
+
+        text = str(message).strip()
+        if not text:
+            return
+        msg = f"ALERT: {text}"
+
+        if channel == "daily":
+            chat_id = self.daily_chat_id
+            thread_id = self.daily_thread_id
+        else:
+            chat_id = self.trades_chat_id
+            thread_id = self.trades_thread_id
+
+        if not self.send_enabled:
+            logger.warning("Telegram alert (suppressed dry-run): %s", msg)
+            return
+        if chat_id is None or thread_id is None:
+            return
+
+        chunks = chunk_text(msg)
+        for chunk in chunks:
+            try:
+                self._send_text(chat_id=chat_id, thread_id=thread_id, text=chunk)
+            except Exception:
+                logger.exception("Failed to send alert telegram message")
+                return
+
     def notify_daily_report(self, *, telegram_text_path: Path, logger: Any) -> None:
         if not self.enabled:
             return

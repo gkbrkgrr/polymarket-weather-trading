@@ -30,7 +30,10 @@ p_model_max: 0.12
 edge_threshold: 0.02
 max_no_price: 0.92
 max_spread: 0.05
+max_probability_age_days: 2
 max_snapshot_age_minutes: 30
+pause_on_stale_probabilities: true
+pause_on_stale_snapshots: true
 top_n_per_event_day: 2
 
 stake_fraction: 0.005

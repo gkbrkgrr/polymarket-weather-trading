@@ -37,6 +37,7 @@ This directory contains a production-minded, minimal scaffold for running a NO-o
 - No API keys are required for this implementation.
 - `--dry-run` performs selection/logging only and does not place any orders.
 - `mode: live` currently points to a stub `RealExecutionClient` and is intentionally not wired to real credentials.
+- Runtime health gates pause new trades when probabilities or snapshots are stale and emit explicit alerts.
 
 ## How To Run
 
@@ -69,6 +70,45 @@ Healthcheck:
 python live_trading/run_live_pilot.py --config live_trading/config.live_pilot.yaml healthcheck
 ```
 
+## LT-07 Automation (4x/day)
+
+To automate end-to-end cycle processing at each nominal GFS publish window, use:
+
+```bash
+python scripts/trigger_gfs_cycle_pipeline.py
+```
+
+What it does:
+- infers the latest publish-eligible cycle from UTC schedule (`00z/06z/12z/18z`)
+- runs `scripts/run_gfs_cycle_pipeline.py --cycle <cycle> ...`
+- verifies `reports/live_probabilities/latest_manifest.json` was updated for that cycle
+- persists idempotency state in `live_trading/state/gfs_cycle_trigger_state.json` so each cycle runs once unless `--force` is used
+
+Useful checks:
+
+```bash
+# print resolved cycle + downstream command without executing
+python scripts/trigger_gfs_cycle_pipeline.py --dry-run
+
+# deterministic test at a fixed UTC clock
+python scripts/trigger_gfs_cycle_pipeline.py --now-utc 202603061540 --dry-run
+```
+
+Systemd templates are provided for production scheduling:
+- `deploy/polymarket-gfs-cycle-trigger.service`
+- `deploy/polymarket-gfs-cycle-trigger.timer`
+
+Install example:
+
+```bash
+# first edit ExecStart/WorkingDirectory in the service file for your host paths
+sudo cp deploy/polymarket-gfs-cycle-trigger.service /etc/systemd/system/
+sudo cp deploy/polymarket-gfs-cycle-trigger.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now polymarket-gfs-cycle-trigger.timer
+systemctl list-timers --all | grep polymarket-gfs-cycle-trigger
+```
+
 ## Example Config
 
 See [`config.live_pilot.yaml`](./config.live_pilot.yaml).
@@ -77,6 +117,8 @@ Key fields:
 - `mode`: `paper` or `live` (default `paper`)
 - `db_dsn`: master Postgres DSN
 - `probabilities_path`: precomputed probabilities file/directory (default: `reports/live_probabilities`; auto-resolves newest valid cycle from manifests)
+- `max_probability_age_days`, `max_snapshot_age_minutes`: freshness thresholds for runtime health gates
+- `pause_on_stale_probabilities`, `pause_on_stale_snapshots`: enable/disable runtime trade pause on stale data
 - `stations_allowlist`, thresholds, risk limits, execution settings, scheduling, reporting
 - `telegram_notifications`: topic links + credentials for in-process sends
 

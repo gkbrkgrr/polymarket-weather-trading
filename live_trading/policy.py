@@ -16,6 +16,7 @@ SKIP_REASONS = {
     "no_snapshot",
     "snapshot_too_old",
     "spread_too_wide",
+    "health_gate_blocked",
     "p_model_too_high",
     "mode_distance_fail",
     "edge_too_low",

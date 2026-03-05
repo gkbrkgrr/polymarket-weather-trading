@@ -1,0 +1,12 @@
+[Unit]
+Description=Polymarket Weather GFS Cycle Trigger
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/polymarket-weather-trading
+ExecStart=/opt/polymarket-weather-trading/.venv/bin/python /opt/polymarket-weather-trading/scripts/trigger_gfs_cycle_pipeline.py
+
+[Install]
+WantedBy=multi-user.target

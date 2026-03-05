@@ -1,0 +1,13 @@
+[Unit]
+Description=Run Polymarket Weather GFS Cycle Trigger 4x/day
+
+[Timer]
+# GFS nominal publish windows in UTC with a small delay buffer.
+OnCalendar=*-*-* 03,09,15,21:40:00 UTC
+Persistent=true
+RandomizedDelaySec=120
+AccuracySec=1m
+Unit=polymarket-gfs-cycle-trigger.service
+
+[Install]
+WantedBy=timers.target
