@@ -1,0 +1,69 @@
+mode: paper
+
+db_dsn: postgresql://archive_user:password@127.0.0.1:5432/master_db
+probabilities_path: reports/probability_backtest_multi/market_level_probabilities.parquet
+output_dir: live_trading
+
+nav_usd: 250
+stations_allowlist:
+  - Atlanta
+  - Dallas
+  - Toronto
+  - Ankara
+  - Seattle
+  - SaoPaulo
+  - Seoul
+  - Chicago
+stations_watchlist:
+  - London
+  - Paris
+  - Miami
+market_types:
+  - highest_temperature
+
+timezones:
+  default: Europe/London
+  stations: {}
+
+mode_distance_min: 2
+p_model_max: 0.12
+edge_threshold: 0.02
+max_no_price: 0.92
+max_spread: 0.05
+max_snapshot_age_minutes: 30
+top_n_per_event_day: 2
+
+stake_fraction: 0.005
+stake_cap_usd: 50
+station_daily_risk_fraction: 0.02
+portfolio_daily_risk_fraction: 0.05
+stoploss_daily_pnl_fraction: 0.01
+stoploss_consecutive_days: 3
+max_open_positions_per_station: 4
+max_open_positions_total: 20
+
+slippage_buffer_yes_fallback: 0.01
+min_order_size: 1
+price_tick: 0.001
+use_limit_orders: true
+
+run_interval_minutes: 0.1
+decision_cutoff_policy: latest_cycle_before_local_midnight
+lookahead_days: 4
+trade_window:
+  start_local: "00:00"
+  end_local: "12:00"
+
+log_level: INFO
+write_jsonl_log: true
+write_csv_trades: true
+daily_report_time_local: "23:59"
+telegram_templates:
+  enabled: true
+
+telegram_notifications:
+  enabled: true
+  credentials_file: .secrets/telegram_bot.json
+  trades_topic_link: https://t.me/c/3811684844/467/469
+  daily_topic_link: https://t.me/c/3811684844/468/471
+  timeout_seconds: 20.0

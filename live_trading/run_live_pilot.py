@@ -1,0 +1,926 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import re
+import sys
+import time
+import traceback
+import uuid
+from collections.abc import Mapping
+from datetime import date, datetime, timedelta
+from pathlib import Path
+from typing import Any
+from zoneinfo import ZoneInfo
+
+import pandas as pd
+import psycopg
+import yaml
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from live_trading import db as dbmod
+from live_trading.execution import DummyExecutionClient, RealExecutionClient
+from live_trading.policy import PolicyContext, apply_policy
+from live_trading.pricing import compute_pricing_decision
+from live_trading.reporting import generate_daily_report
+from live_trading.state import PilotStateStore
+from live_trading.telegram_notify import TelegramNotifier
+from live_trading.utils_time import (
+    load_station_timezones,
+    normalize_station_key,
+    passes_decision_cutoff,
+    station_timezone,
+    to_yyyymmdd,
+    today_local,
+    utc_now,
+)
+
+
+STRIKE_SUFFIX_RE = re.compile(r"-(?:neg-\d+|\d+)c$|-(?:\d+-\d+f|\d+forbelow|\d+forhigher|\d+f)$")
+GENERIC_DIR_NAMES = {
+    "reports",
+    "report",
+    "data",
+    "probabilitybacktest",
+    "backtest",
+    "output",
+    "outputs",
+}
+
+DEFAULT_CONFIG: dict[str, Any] = {
+    "mode": "paper",
+    "db_dsn": "postgresql://archive_user:password@127.0.0.1:5432/master_db",
+    "probabilities_path": "reports/probability_backtest_multi/market_level_probabilities.parquet",
+    "output_dir": "live_trading",
+    "nav_usd": 10000,
+    "stations_allowlist": ["Atlanta", "Dallas", "Toronto", "Ankara", "Seattle", "SaoPaulo", "Seoul", "Chicago"],
+    "stations_watchlist": ["London", "Paris", "Miami"],
+    "market_types": ["highest_temperature"],
+    "timezones": {"default": "Europe/London", "stations": {}},
+    "mode_distance_min": 2,
+    "p_model_max": 0.12,
+    "edge_threshold": 0.02,
+    "max_no_price": 0.92,
+    "max_spread": 0.05,
+    "max_snapshot_age_minutes": 30,
+    "top_n_per_event_day": 2,
+    "stake_fraction": 0.005,
+    "stake_cap_usd": 50,
+    "station_daily_risk_fraction": 0.02,
+    "portfolio_daily_risk_fraction": 0.05,
+    "stoploss_daily_pnl_fraction": 0.01,
+    "stoploss_consecutive_days": 3,
+    "max_open_positions_per_station": 4,
+    "max_open_positions_total": 20,
+    "slippage_buffer_yes_fallback": 0.01,
+    "min_order_size": 1,
+    "price_tick": 0.001,
+    "use_limit_orders": True,
+    "run_interval_minutes": 10,
+    "decision_cutoff_policy": "latest_cycle_before_local_midnight",
+    "lookahead_days": 4,
+    "trade_window": {"start_local": "00:00", "end_local": "12:00"},
+    "log_level": "INFO",
+    "write_jsonl_log": True,
+    "write_csv_trades": True,
+    "daily_report_time_local": "23:59",
+    "telegram_templates": {"enabled": True},
+    "telegram_notifications": {
+        "enabled": True,
+        "credentials_file": ".secrets/telegram_bot.json",
+        "trades_topic_link": "https://t.me/c/3811684844/467/469",
+        "daily_topic_link": "https://t.me/c/3811684844/468/471",
+        "timeout_seconds": 20.0,
+    },
+}
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Run live trading pilot scaffold.")
+    parser.add_argument("--config", type=Path, required=True, help="Path to YAML config.")
+    parser.add_argument("--dry-run", action="store_true", help="Only evaluate policy and log WOULD-trade decisions.")
+    parser.add_argument("--once", action="store_true", help="Run a single cycle and exit.")
+    parser.add_argument(
+        "command",
+        nargs="?",
+        default="run",
+        choices=["run", "healthcheck"],
+        help="run (default) or healthcheck",
+    )
+    return parser.parse_args(argv)
+
+
+def deep_merge(base: dict[str, Any], override: Mapping[str, Any]) -> dict[str, Any]:
+    out = dict(base)
+    for key, value in override.items():
+        if isinstance(value, Mapping) and isinstance(out.get(key), Mapping):
+            out[key] = deep_merge(dict(out[key]), value)
+        else:
+            out[key] = value
+    return out
+
+
+def load_config(path: Path) -> dict[str, Any]:
+    loaded = yaml.safe_load(path.read_text(encoding="utf-8"))
+    if loaded is None:
+        loaded = {}
+    if not isinstance(loaded, dict):
+        raise SystemExit(f"Config must be a mapping: {path}")
+    cfg = deep_merge(DEFAULT_CONFIG, loaded)
+    return cfg
+
+
+def resolve_path(path_value: str | Path) -> Path:
+    path = Path(path_value)
+    if path.is_absolute():
+        return path
+    return (REPO_ROOT / path).resolve()
+
+
+def setup_logger(log_path: Path, level: str) -> logging.Logger:
+    logger = logging.getLogger("live_pilot")
+    logger.handlers = []
+    logger.setLevel(getattr(logging, str(level).upper(), logging.INFO))
+
+    formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
+    file_handler = logging.FileHandler(log_path, encoding="utf-8")
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+
+    stream_handler = logging.StreamHandler(sys.stdout)
+    stream_handler.setFormatter(formatter)
+    logger.addHandler(stream_handler)
+    return logger
+
+
+def _derive_event_key(slug: str) -> str:
+    return STRIKE_SUFFIX_RE.sub("", str(slug))
+
+
+def _derive_station_from_source_path(source_path: str) -> str | None:
+    p = Path(str(source_path))
+    parents = [p.parent.name, p.parent.parent.name]
+    for cand in parents:
+        key = normalize_station_key(cand)
+        if key and key not in GENERIC_DIR_NAMES:
+            return cand
+    stem = p.stem.lower()
+    stem = re.sub(r"market[_-]?level[_-]?probabilities", "", stem).strip("-_ ")
+    if normalize_station_key(stem):
+        return stem
+    return None
+
+
+def read_probability_files(path: Path) -> pd.DataFrame:
+    if path.is_file():
+        files = [path]
+    elif path.is_dir():
+        patterns = [
+            "**/market_level_probabilities.parquet",
+            "**/market_level_probabilities.csv",
+            "**/*market_level_probabilities*.parquet",
+            "**/*market_level_probabilities*.csv",
+        ]
+        files = []
+        seen: set[str] = set()
+        for pat in patterns:
+            for f in sorted(path.glob(pat)):
+                key = str(f.resolve())
+                if key in seen:
+                    continue
+                seen.add(key)
+                files.append(f)
+    else:
+        raise SystemExit(f"Probabilities path not found: {path}")
+
+    if not files:
+        raise SystemExit(f"No market probability files found under: {path}")
+
+    parts: list[pd.DataFrame] = []
+    for f in files:
+        if f.suffix.lower() == ".parquet":
+            part = pd.read_parquet(f)
+        else:
+            part = pd.read_csv(f)
+        part["__source_path"] = str(f)
+        parts.append(part)
+    return pd.concat(parts, ignore_index=True)
+
+
+def standardize_probabilities(raw: pd.DataFrame) -> pd.DataFrame:
+    out = raw.copy()
+    if "slug" not in out.columns:
+        raise SystemExit("Probability input must include slug column.")
+    out["slug"] = out["slug"].astype("string")
+
+    station_col = None
+    for c in ["station_name", "station", "city_name", "city"]:
+        if c in out.columns:
+            station_col = c
+            break
+    if station_col is not None:
+        out["station"] = out[station_col].astype("string").str.strip()
+    else:
+        src_station = out["__source_path"].astype("string").map(_derive_station_from_source_path)
+        out["station"] = src_station.astype("string")
+
+    if "date" in out.columns:
+        out["date"] = pd.to_datetime(out["date"], errors="coerce").dt.normalize()
+    elif "market_day_local" in out.columns:
+        out["date"] = pd.to_datetime(out["market_day_local"], errors="coerce").dt.normalize()
+    else:
+        raise SystemExit("Probability input must include date or market_day_local.")
+
+    if "strike_k" in out.columns:
+        out["strike_k"] = pd.to_numeric(out["strike_k"], errors="coerce").astype("Int64")
+    elif "strike" in out.columns:
+        out["strike_k"] = pd.to_numeric(out["strike"], errors="coerce").astype("Int64")
+    else:
+        raise SystemExit("Probability input must include strike_k or strike.")
+
+    if "p_model" in out.columns:
+        out["p_model"] = pd.to_numeric(out["p_model"], errors="coerce")
+    elif "p_model_residual" in out.columns:
+        out["p_model"] = pd.to_numeric(out["p_model_residual"], errors="coerce")
+    else:
+        raise SystemExit("Probability input must include p_model or p_model_residual.")
+
+    if "mode_k" in out.columns:
+        out["mode_k"] = pd.to_numeric(out["mode_k"], errors="coerce").astype("Int64")
+    else:
+        out["mode_k"] = pd.Series([pd.NA] * len(out), dtype="Int64")
+
+    out["market_id"] = out["market_id"].astype("string") if "market_id" in out.columns else pd.Series([pd.NA] * len(out), dtype="string")
+    out["event_key"] = out["slug"].astype("string").map(_derive_event_key)
+    out["market_day_local"] = pd.to_datetime(out["date"], errors="coerce").dt.normalize()
+
+    execution_raw = None
+    for c in ["execution_time_utc", "decision_cycle_time_utc"]:
+        if c in out.columns:
+            execution_raw = out[c]
+            break
+    if execution_raw is None:
+        out["execution_time_utc"] = pd.NaT
+    else:
+        out["execution_time_utc"] = pd.to_datetime(execution_raw, utc=True, errors="coerce")
+
+    out = out.dropna(subset=["station", "date", "slug", "strike_k", "p_model"]).copy()
+    out["station"] = out["station"].astype(str).str.strip()
+    out = out.loc[out["station"] != ""].copy()
+
+    out["strike_k"] = out["strike_k"].astype(int)
+
+    missing_mode = out["mode_k"].isna()
+    if missing_mode.any():
+        mode_df = (
+            out.sort_values(["station", "date", "event_key", "p_model", "strike_k"], ascending=[True, True, True, False, True], kind="mergesort")
+            .drop_duplicates(subset=["station", "date", "event_key"], keep="first")
+            [["station", "date", "event_key", "strike_k"]]
+            .rename(columns={"strike_k": "mode_k_derived"})
+        )
+        out = out.merge(mode_df, on=["station", "date", "event_key"], how="left")
+        out.loc[missing_mode, "mode_k"] = out.loc[missing_mode, "mode_k_derived"]
+        out = out.drop(columns=["mode_k_derived"], errors="ignore")
+
+    out["mode_k"] = pd.to_numeric(out["mode_k"], errors="coerce").astype("Int64")
+    out = out.dropna(subset=["mode_k"]).copy()
+    out["mode_k"] = out["mode_k"].astype(int)
+
+    out = out.sort_values(["station", "date", "event_key", "strike_k", "slug"], kind="mergesort")
+    out = out.drop_duplicates(subset=["station", "date", "event_key", "strike_k", "slug"], keep="last")
+    return out
+
+
+def build_station_timezone_map(cfg: dict[str, Any], stations: list[str]) -> dict[str, str]:
+    csv_tz = load_station_timezones()
+    out: dict[str, str] = {}
+    for station in stations:
+        out[station] = station_timezone(
+            station,
+            config_timezones=cfg.get("timezones", {}),
+            fallback_timezones=csv_tz,
+        )
+    return out
+
+
+def select_live_universe(
+    *,
+    prob: pd.DataFrame,
+    cfg: dict[str, Any],
+    station_tz: dict[str, str],
+    now_utc: datetime,
+) -> pd.DataFrame:
+    allowlist = [str(s).strip() for s in cfg.get("stations_allowlist", []) if str(s).strip()]
+    if not allowlist:
+        raise SystemExit("stations_allowlist must be non-empty.")
+
+    out = prob.loc[prob["station"].isin(allowlist)].copy()
+    if out.empty:
+        return out
+
+    lookahead = int(cfg.get("lookahead_days", 4))
+    keep_idx: list[int] = []
+    for idx, row in out.iterrows():
+        station = str(row["station"])
+        tz = station_tz.get(station, str(cfg.get("timezones", {}).get("default", "UTC")))
+        market_day = pd.to_datetime(row["market_day_local"], errors="coerce")
+        if pd.isna(market_day):
+            continue
+        market_day_local = market_day.date()
+        local_today = today_local(tz, now_utc=now_utc)
+        if market_day_local < local_today or market_day_local > local_today + timedelta(days=lookahead):
+            continue
+
+        execution = pd.to_datetime(row.get("execution_time_utc"), utc=True, errors="coerce")
+        execution_dt = None if pd.isna(execution) else execution.to_pydatetime()
+        if execution_dt is not None:
+            if not passes_decision_cutoff(
+                execution_time_utc=execution_dt,
+                market_day_local=market_day_local,
+                timezone_name=tz,
+                policy=str(cfg.get("decision_cutoff_policy", "latest_cycle_before_local_midnight")),
+            ):
+                continue
+        keep_idx.append(idx)
+
+    if not keep_idx:
+        return out.iloc[0:0].copy()
+
+    out = out.loc[keep_idx].copy()
+    if "highest_temperature" in cfg.get("market_types", ["highest_temperature"]):
+        out = out.loc[out["slug"].astype(str).str.startswith("highest-temperature-in-")].copy()
+    return out
+
+
+def _append_jsonl(path: Path, record: dict[str, Any]) -> None:
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=True, sort_keys=True) + "\n")
+
+
+def _clean_for_json(payload: dict[str, Any]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for k, v in payload.items():
+        if isinstance(v, (datetime, date)):
+            out[k] = v.isoformat()
+        elif isinstance(v, pd.Timestamp):
+            out[k] = v.isoformat()
+        elif hasattr(v, "item") and callable(getattr(v, "item")):
+            try:
+                out[k] = v.item()
+            except Exception:
+                out[k] = v
+        else:
+            try:
+                if pd.isna(v):
+                    out[k] = None
+                    continue
+            except Exception:
+                pass
+            out[k] = v
+    return out
+
+
+def _log_action(
+    *,
+    logger: logging.Logger,
+    jsonl_path: Path | None,
+    conn: psycopg.Connection | None,
+    run_id: str,
+    payload: dict[str, Any],
+) -> None:
+    clean = _clean_for_json(payload)
+    logger.info(
+        "[%s] %s %s edge=%s price=%s reason=%s",
+        clean.get("station"),
+        clean.get("decision"),
+        clean.get("slug") or clean.get("market_id"),
+        clean.get("edge"),
+        clean.get("chosen_no_ask"),
+        clean.get("skipped_reason") or "",
+    )
+
+    if jsonl_path is not None:
+        _append_jsonl(jsonl_path, clean)
+
+    if conn is not None:
+        try:
+            dbmod.insert_live_action(
+                conn,
+                run_id=run_id,
+                station=clean.get("station"),
+                market_id=clean.get("market_id"),
+                decision=str(clean.get("decision", "")),
+                payload=clean,
+            )
+        except Exception:
+            logger.exception("Failed to insert live action row into DB")
+
+
+def _update_stoploss_and_kills(
+    *,
+    cfg: dict[str, Any],
+    state_store: PilotStateStore,
+    stations: list[str],
+    day_local: date,
+    logger: logging.Logger,
+) -> None:
+    day_key = day_local.isoformat()
+    nav_ref = float(cfg.get("nav_usd", state_store.nav_usd))
+    threshold = -abs(float(cfg.get("stoploss_daily_pnl_fraction", 0.01))) * nav_ref
+
+    total_pnl = state_store.daily_realized_pnl(day_local=day_key)
+    for station in stations:
+        station_pnl = state_store.station_daily_realized_pnl(day_local=day_key, station=station)
+        hit = station_pnl < threshold
+        state_store.mark_station_stoploss(day_local=day_key, station=station, triggered=hit)
+        if hit:
+            state_store.set_station_paused(station, True)
+
+    stoploss = state_store.state.setdefault("stoploss", {"consecutive_days_hit": 0, "history": []})
+    history = stoploss.setdefault("history", [])
+    already_recorded_today = bool(history and str(history[-1].get("day_local")) == day_key)
+    if not already_recorded_today:
+        streak = state_store.update_stoploss_streak(day_local=day_key, stoploss_hit=(total_pnl < threshold))
+        if streak >= int(cfg.get("stoploss_consecutive_days", 3)):
+            state_store.set_global_kill(True)
+            logger.warning("Global kill activated due to stoploss streak=%d", streak)
+
+    portfolio_risk = state_store.portfolio_risk_used(day_local=day_key)
+    portfolio_limit = float(state_store.nav_usd) * float(cfg.get("portfolio_daily_risk_fraction", 0.05))
+    if portfolio_risk >= portfolio_limit:
+        state_store.set_global_kill(True)
+        logger.warning("Global kill activated due to portfolio daily risk limit")
+
+
+def _settle_resolved_positions(
+    *,
+    conn: psycopg.Connection,
+    state_store: PilotStateStore,
+    run_id: str,
+    logger: logging.Logger,
+    jsonl_path: Path | None,
+    notifier: TelegramNotifier | None,
+) -> None:
+    open_positions = [p for p in state_store.open_positions() if str(p.get("status", "open")) == "open"]
+    if not open_positions:
+        return
+
+    market_ids = sorted({str(p.get("market_id")) for p in open_positions if p.get("market_id")})
+    if not market_ids:
+        return
+
+    resolved = dbmod.fetch_resolved_outcomes(conn, market_ids=market_ids)
+    if resolved.empty:
+        return
+
+    resolved_map = {str(r.market_id): r for r in resolved.itertuples(index=False)}
+
+    for pos in open_positions:
+        market_id = str(pos.get("market_id"))
+        row = resolved_map.get(market_id)
+        if row is None:
+            continue
+        if row.no_wins is None:
+            continue
+
+        entry_price = float(pos.get("entry_price"))
+        size = float(pos.get("size"))
+        if bool(row.no_wins):
+            pnl = (1.0 - entry_price) * size
+            resolution = "no_wins"
+        else:
+            pnl = -entry_price * size
+            resolution = "yes_wins"
+
+        closed = state_store.close_position(
+            str(pos.get("position_id")),
+            close_ts_utc=utc_now(),
+            pnl=pnl,
+            resolution=resolution,
+        )
+        if closed is None:
+            continue
+
+        station = str(pos.get("station"))
+        day_key = today_local("UTC").isoformat()
+        state_store.add_realized_pnl(day_local=day_key, station=station, pnl=pnl)
+        state_store.set_nav_usd(state_store.nav_usd + pnl)
+
+        payload = {
+            "ts_utc": utc_now().isoformat(),
+            "station": station,
+            "market_day_local": pos.get("market_day_local"),
+            "market_id": market_id,
+            "slug": pos.get("slug"),
+            "asset_id": pos.get("asset_id"),
+            "strike_k": pos.get("strike_k"),
+            "mode_k": pos.get("mode_k"),
+            "p_model": pos.get("p_model"),
+            "entry_price": entry_price,
+            "buy_price": entry_price,
+            "size": size,
+            "decision": "RESOLVE",
+            "skipped_reason": "",
+            "order_id": pos.get("position_id"),
+            "order_status": "closed",
+            "pnl_realized": pnl,
+            "resolution": resolution,
+        }
+        _log_action(logger=logger, jsonl_path=jsonl_path, conn=conn, run_id=run_id, payload=payload)
+        if notifier is not None:
+            notifier.notify_trade(payload, logger=logger)
+
+
+def _should_emit_daily_report(*, cfg: dict[str, Any], state_store: PilotStateStore, now_local: datetime) -> bool:
+    report_hhmm = str(cfg.get("daily_report_time_local", "23:59"))
+    target_h, target_m = [int(x) for x in report_hhmm.split(":", 1)]
+    target_now = now_local.replace(hour=target_h, minute=target_m, second=0, microsecond=0)
+    if now_local < target_now:
+        return False
+
+    last_report = state_store.last_report_date_local()
+    if last_report == now_local.date().isoformat():
+        return False
+    return True
+
+
+def run_healthcheck(cfg: dict[str, Any]) -> int:
+    checks: list[tuple[str, bool, str]] = []
+
+    allowlist = [str(s).strip() for s in cfg.get("stations_allowlist", []) if str(s).strip()]
+    checks.append(("station_allowlist_non_empty", bool(allowlist), f"count={len(allowlist)}"))
+
+    prob_path = resolve_path(str(cfg.get("probabilities_path")))
+    try:
+        raw = read_probability_files(prob_path)
+        prob = standardize_probabilities(raw)
+        latest_date = pd.to_datetime(prob["date"], errors="coerce").max()
+        latest_date_txt = "none" if pd.isna(latest_date) else latest_date.date().isoformat()
+        fresh = (not pd.isna(latest_date)) and (latest_date.date() >= date.today() - timedelta(days=2))
+        checks.append(("probabilities_recent", bool(fresh), f"path={prob_path} latest_date={latest_date_txt}"))
+    except Exception as exc:
+        checks.append(("probabilities_recent", False, f"path={prob_path} error={exc}"))
+
+    try:
+        with dbmod.connect_db(str(cfg.get("db_dsn"))) as conn:
+            snap_info = dbmod.detect_snapshot_table(conn)
+            max_ts = dbmod.fetch_snapshots_freshness(conn, snapshot_table=snap_info)
+            checks.append(("db_connectivity", True, f"snapshot_table={snap_info.table_name}"))
+            if max_ts is None:
+                checks.append(("snapshots_freshness", False, "no snapshot rows"))
+            else:
+                age_m = max(0.0, (utc_now() - max_ts).total_seconds() / 60.0)
+                limit = float(cfg.get("max_snapshot_age_minutes", 30))
+                checks.append(("snapshots_freshness", age_m <= limit, f"age_minutes={age_m:.1f} limit={limit:.1f}"))
+    except Exception as exc:
+        checks.append(("db_connectivity", False, str(exc)))
+        checks.append(("snapshots_freshness", False, "db unavailable"))
+
+    failed = False
+    for name, ok, detail in checks:
+        status = "PASS" if ok else "FAIL"
+        print(f"[{status}] {name}: {detail}")
+        if not ok:
+            failed = True
+    return 1 if failed else 0
+
+
+def run_cycle(
+    *,
+    cfg: dict[str, Any],
+    run_id: str,
+    logger: logging.Logger,
+    state_store: PilotStateStore,
+    output_dir: Path,
+    dry_run: bool,
+    conn: psycopg.Connection,
+    snapshot_info: dbmod.SnapshotTableInfo,
+    notifier: TelegramNotifier | None,
+) -> None:
+    now = utc_now()
+    jsonl_path = output_dir / "logs" / f"trades_{to_yyyymmdd(now.date())}.jsonl" if bool(cfg.get("write_jsonl_log", True)) else None
+
+    prob_path = resolve_path(str(cfg.get("probabilities_path")))
+    raw_prob = read_probability_files(prob_path)
+    prob = standardize_probabilities(raw_prob)
+
+    stations = [str(s).strip() for s in cfg.get("stations_allowlist", []) if str(s).strip()]
+    station_tz = build_station_timezone_map(cfg, stations)
+
+    universe = select_live_universe(prob=prob, cfg=cfg, station_tz=station_tz, now_utc=now)
+    if universe.empty:
+        logger.info("No probability rows in live universe after station/date/cutoff filters")
+        return
+
+    metadata = dbmod.fetch_market_metadata(
+        conn,
+        slugs=universe["slug"].dropna().astype(str).unique().tolist(),
+        market_ids=universe["market_id"].dropna().astype(str).unique().tolist(),
+    )
+    if not metadata.empty:
+        universe = universe.merge(metadata[["market_id", "slug", "asset_id"]], on=["market_id", "slug"], how="left", suffixes=("", "_meta"))
+        if "asset_id_meta" in universe.columns:
+            universe["asset_id"] = universe.get("asset_id", pd.Series([pd.NA] * len(universe), dtype="string")).fillna(universe["asset_id_meta"])
+            universe = universe.drop(columns=["asset_id_meta"], errors="ignore")
+    else:
+        universe["asset_id"] = pd.Series([pd.NA] * len(universe), dtype="string")
+
+    missing_mid = universe["market_id"].isna()
+    if missing_mid.any() and not metadata.empty:
+        slug_to_market = metadata.dropna(subset=["slug", "market_id"]).drop_duplicates("slug").set_index("slug")["market_id"].to_dict()
+        slug_to_asset = metadata.dropna(subset=["slug"]).drop_duplicates("slug").set_index("slug")["asset_id"].to_dict()
+        universe.loc[missing_mid, "market_id"] = universe.loc[missing_mid, "slug"].map(slug_to_market)
+        universe.loc[universe["asset_id"].isna(), "asset_id"] = universe.loc[universe["asset_id"].isna(), "slug"].map(slug_to_asset)
+
+    market_ids = sorted(universe["market_id"].dropna().astype(str).unique().tolist())
+    snapshot_df = dbmod.fetch_latest_snapshots(conn, snapshot_table=snapshot_info, market_ids=market_ids)
+    snapshot_map = {
+        str(row.market_id): {
+            "yes_snapshot_ts_utc": row.yes_snapshot_ts_utc,
+            "no_snapshot_ts_utc": row.no_snapshot_ts_utc,
+            "best_yes_bid": row.best_yes_bid,
+            "best_yes_ask": row.best_yes_ask,
+            "best_no_bid": row.best_no_bid,
+            "best_no_ask": row.best_no_ask,
+            "yes_bid_size": row.yes_bid_size,
+            "yes_ask_size": row.yes_ask_size,
+            "no_bid_size": row.no_bid_size,
+            "no_ask_size": row.no_ask_size,
+        }
+        for row in snapshot_df.itertuples(index=False)
+    }
+
+    records: list[dict[str, Any]] = []
+    for row in universe.itertuples(index=False):
+        market_day_ts = pd.to_datetime(row.market_day_local, errors="coerce")
+        if pd.isna(market_day_ts):
+            continue
+        snapshot = None if pd.isna(row.market_id) else snapshot_map.get(str(row.market_id))
+        pricing = compute_pricing_decision(
+            snapshot=snapshot,
+            now_utc=now,
+            max_snapshot_age_minutes=float(cfg.get("max_snapshot_age_minutes", 30)),
+            slippage_buffer_yes_fallback=float(cfg.get("slippage_buffer_yes_fallback", 0.01)),
+            max_spread=float(cfg.get("max_spread", 0.05)),
+        )
+
+        record = {
+            "ts_utc": now.isoformat(),
+            "station": str(row.station),
+            "market_day_local": market_day_ts.date().isoformat(),
+            "market_id": None if pd.isna(row.market_id) else str(row.market_id),
+            "slug": str(row.slug),
+            "asset_id": None if pd.isna(getattr(row, "asset_id", pd.NA)) else str(getattr(row, "asset_id")),
+            "event_key": str(row.event_key),
+            "strike_k": int(row.strike_k),
+            "mode_k": int(row.mode_k),
+            "p_model": float(row.p_model),
+            "execution_time_utc": pd.to_datetime(row.execution_time_utc, utc=True, errors="coerce").isoformat() if not pd.isna(pd.to_datetime(row.execution_time_utc, utc=True, errors="coerce")) else None,
+            "snapshot_ts_utc": pricing.snapshot_ts_utc.isoformat() if pricing.snapshot_ts_utc else None,
+            "snapshot_age_minutes": pricing.snapshot_age_minutes,
+            "best_yes_bid": snapshot.get("best_yes_bid") if snapshot else None,
+            "best_yes_ask": snapshot.get("best_yes_ask") if snapshot else None,
+            "best_no_bid": snapshot.get("best_no_bid") if snapshot else None,
+            "best_no_ask": snapshot.get("best_no_ask") if snapshot else None,
+            "chosen_no_ask": pricing.chosen_no_ask,
+            "price_source": pricing.price_source,
+            "spread": pricing.spread,
+            "snapshot_skip_reason": pricing.skipped_reason,
+            "edge_threshold": float(cfg.get("edge_threshold", 0.02)),
+            "NAV": float(state_store.nav_usd),
+            "order_id": None,
+            "order_status": None,
+            "error": None,
+        }
+        records.append(record)
+
+    candidates = pd.DataFrame.from_records(records)
+    if candidates.empty:
+        logger.info("No candidates generated")
+        return
+
+    policy_ctx = PolicyContext(
+        nav_usd=float(state_store.nav_usd),
+        mode_distance_min=int(cfg.get("mode_distance_min", 2)),
+        p_model_max=float(cfg.get("p_model_max", 0.12)),
+        edge_threshold=float(cfg.get("edge_threshold", 0.02)),
+        max_no_price=float(cfg.get("max_no_price", 0.92)),
+        top_n_per_event_day=int(cfg.get("top_n_per_event_day", 2)),
+        stake_fraction=float(cfg.get("stake_fraction", 0.005)),
+        stake_cap_usd=float(cfg.get("stake_cap_usd", 50)),
+        min_order_size=float(cfg.get("min_order_size", 1)),
+        station_daily_risk_fraction=float(cfg.get("station_daily_risk_fraction", 0.02)),
+        portfolio_daily_risk_fraction=float(cfg.get("portfolio_daily_risk_fraction", 0.05)),
+        max_open_positions_per_station=int(cfg.get("max_open_positions_per_station", 4)),
+        max_open_positions_total=int(cfg.get("max_open_positions_total", 20)),
+        trade_window_start_local=str(cfg.get("trade_window", {}).get("start_local", "00:00")),
+        trade_window_end_local=str(cfg.get("trade_window", {}).get("end_local", "12:00")),
+    )
+
+    policy_out = apply_policy(
+        candidates=candidates,
+        state_store=state_store,
+        ctx=policy_ctx,
+        now_utc=now,
+        station_timezones=station_tz,
+    )
+
+    mode = str(cfg.get("mode", "paper")).lower()
+    if mode == "paper":
+        exec_client: Any = DummyExecutionClient(price_tick=float(cfg.get("price_tick", 0.001)), conservative_fill=True)
+    elif mode == "live":
+        exec_client = RealExecutionClient()
+    else:
+        raise SystemExit(f"Invalid mode: {mode}")
+
+    csv_trades_rows: list[dict[str, Any]] = []
+
+    for row in policy_out.itertuples(index=False):
+        payload = row._asdict()
+        payload.setdefault("decision", "SKIP")
+        payload.setdefault("skipped_reason", "")
+        payload["ts_utc"] = now.isoformat()
+
+        if payload["decision"] == "TRADE":
+            if dry_run:
+                payload["order_status"] = "dry_run_would_trade"
+                payload["order_id"] = None
+            else:
+                try:
+                    order_id = exec_client.place_order(
+                        market_id=str(payload["market_id"]),
+                        side="buy",
+                        outcome="NO",
+                        price=float(payload["chosen_no_ask"]),
+                        size=float(payload["size"]),
+                    )
+                    payload["order_id"] = order_id
+                    payload["order_status"] = "submitted"
+
+                    if hasattr(exec_client, "execution_result"):
+                        res = exec_client.execution_result(order_id)
+                        if res is not None:
+                            payload["order_status"] = res.order_status
+                            if res.filled_price is not None:
+                                payload["chosen_no_ask"] = float(res.filled_price)
+                                payload["stake_usd"] = float(payload["chosen_no_ask"]) * float(payload["size"])
+
+                    day_key = str(payload["market_day_local"])
+                    station = str(payload["station"])
+                    state_store.add_trade(day_local=day_key, station=station, risk_used=float(payload.get("stake_usd") or 0.0))
+
+                    pos_id = state_store.add_open_position(
+                        {
+                            "station": station,
+                            "market_day_local": day_key,
+                            "market_id": payload.get("market_id"),
+                            "slug": payload.get("slug"),
+                            "asset_id": payload.get("asset_id"),
+                            "strike_k": payload.get("strike_k"),
+                            "mode_k": payload.get("mode_k"),
+                            "p_model": payload.get("p_model"),
+                            "entry_price": payload.get("chosen_no_ask"),
+                            "size": payload.get("size"),
+                            "stake_usd": payload.get("stake_usd"),
+                            "edge_at_entry": payload.get("edge"),
+                            "price_source": payload.get("price_source"),
+                        }
+                    )
+                    payload["position_id"] = pos_id
+                except Exception as exc:
+                    payload["decision"] = "SKIP"
+                    payload["skipped_reason"] = "kill_switch_active" if state_store.is_global_kill() else "risk_limit_hit"
+                    payload["order_status"] = "error"
+                    payload["error"] = f"{exc.__class__.__name__}: {exc}"
+                    logger.exception("Order placement failed")
+        else:
+            state_store.add_skip(day_local=str(payload["market_day_local"]), station=str(payload["station"]))
+
+        _log_action(logger=logger, jsonl_path=jsonl_path, conn=conn, run_id=run_id, payload=payload)
+        if payload.get("decision") == "TRADE" and notifier is not None:
+            notifier.notify_trade(payload, logger=logger)
+        csv_trades_rows.append(payload)
+
+    _settle_resolved_positions(
+        conn=conn,
+        state_store=state_store,
+        run_id=run_id,
+        logger=logger,
+        jsonl_path=jsonl_path,
+        notifier=notifier,
+    )
+
+    base_tz = str(cfg.get("timezones", {}).get("default", "UTC"))
+    local_day = today_local(base_tz, now_utc=now)
+    _update_stoploss_and_kills(
+        cfg=cfg,
+        state_store=state_store,
+        stations=stations,
+        day_local=local_day,
+        logger=logger,
+    )
+
+    if bool(cfg.get("write_csv_trades", True)) and csv_trades_rows:
+        csv_path = output_dir / "logs" / f"trades_{to_yyyymmdd(now.date())}.csv"
+        pd.DataFrame(csv_trades_rows).to_csv(csv_path, index=False)
+
+    local_now = now.astimezone(ZoneInfo(base_tz))
+    if _should_emit_daily_report(cfg=cfg, state_store=state_store, now_local=local_now):
+        report = generate_daily_report(
+            output_dir=output_dir,
+            logs_dir=output_dir / "logs",
+            state_store=state_store,
+            day_local=local_now.date(),
+            stations=stations,
+            nav_seed=float(cfg.get("nav_usd", 10000)),
+            now_utc=now,
+        )
+        state_store.set_last_report_date_local(local_now.date())
+        try:
+            dbmod.insert_daily_report(
+                conn,
+                report_day_local=local_now.date().isoformat(),
+                payload=report["summary"],
+            )
+        except Exception:
+            logger.exception("Failed to write daily report to DB")
+
+        logger.info("Daily report written: %s", report["json_path"])
+        if notifier is not None:
+            notifier.notify_daily_report(telegram_text_path=Path(report["telegram_path"]), logger=logger)
+
+    state_store.persist()
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    cfg = load_config(args.config)
+
+    output_dir = resolve_path(str(cfg.get("output_dir", "live_trading")))
+    (output_dir / "logs").mkdir(parents=True, exist_ok=True)
+    (output_dir / "reports" / "daily").mkdir(parents=True, exist_ok=True)
+    (output_dir / "state").mkdir(parents=True, exist_ok=True)
+
+    if args.command == "healthcheck":
+        return run_healthcheck(cfg)
+
+    run_id = f"run_{uuid.uuid4().hex[:12]}"
+    today_utc = utc_now().date()
+    log_path = output_dir / "logs" / f"live_pilot_{to_yyyymmdd(today_utc)}.log"
+    logger = setup_logger(log_path, str(cfg.get("log_level", "INFO")))
+
+    logger.info("Starting live pilot run_id=%s mode=%s dry_run=%s", run_id, cfg.get("mode"), args.dry_run)
+
+    try:
+        with dbmod.connect_db(str(cfg.get("db_dsn"))) as conn:
+            dbmod.ensure_live_pilot_tables(conn)
+            snapshot_info = dbmod.detect_snapshot_table(conn)
+
+            state_store = PilotStateStore(output_dir / "state", nav_usd=float(cfg.get("nav_usd", 10000)))
+            notifier = TelegramNotifier.from_config(
+                cfg=cfg,
+                repo_root=REPO_ROOT,
+                send_enabled=(not bool(args.dry_run)),
+                logger=logger,
+            )
+
+            while True:
+                cycle_started = utc_now()
+                try:
+                    run_cycle(
+                        cfg=cfg,
+                        run_id=run_id,
+                        logger=logger,
+                        state_store=state_store,
+                        output_dir=output_dir,
+                        dry_run=bool(args.dry_run),
+                        conn=conn,
+                        snapshot_info=snapshot_info,
+                        notifier=notifier,
+                    )
+                except Exception as exc:
+                    logger.error("Cycle failure: %s", exc)
+                    logger.error(traceback.format_exc())
+
+                if args.once:
+                    break
+
+                elapsed = (utc_now() - cycle_started).total_seconds()
+                wait_s = max(1.0, float(cfg.get("run_interval_minutes", 10)) * 60.0 - elapsed)
+                logger.info("Cycle complete. Sleeping %.1f seconds", wait_s)
+                time.sleep(wait_s)
+
+    except KeyboardInterrupt:
+        logger.info("Interrupted by user")
+        return 0
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
