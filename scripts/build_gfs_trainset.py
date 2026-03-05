@@ -31,14 +31,16 @@ from __future__ import annotations
 
 import argparse
 from concurrent.futures import ProcessPoolExecutor, as_completed
+import json
 import logging
 import math
 import re
+import subprocess
 import sys
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Sequence
 from zoneinfo import ZoneInfo
 
 try:
@@ -66,8 +68,7 @@ except ImportError as exc:  # pragma: no cover - import guard
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
-
-from master_db import get_daily_tmax_by_station, resolve_master_postgres_dsn
+OBS_QUERY_HELPER = REPO_ROOT / "scripts" / "query_daily_tmax_observations.py"
 
 DEFAULT_ARCHIVE_ROOT = (
     REPO_ROOT / "data" / "raster_data" / "gfs_archive"
@@ -405,8 +406,11 @@ def load_obs(
     obs_dsn: str | None = None,
 ) -> pd.DataFrame:
     del obs_root, local_timezone
-    dsn = resolve_master_postgres_dsn(explicit_dsn=obs_dsn)
-    out = get_daily_tmax_by_station(stations=[city_name], master_dsn=dsn)
+    out = query_daily_tmax_observations(
+        stations=[city_name],
+        obs_dsn=obs_dsn,
+        logger=logger,
+    )
     if out.empty:
         logger.warning("Observation rows missing for city=%s in station_observations", city_name)
         return pd.DataFrame({"city_name": [], "target_date_local": [], "tmax_obs_c": []})
@@ -417,6 +421,51 @@ def load_obs(
     out["tmax_obs_c"] = pd.to_numeric(out["tmax_obs_c"], errors="coerce")
     out = out.dropna(subset=["target_date_local", "tmax_obs_c"]).copy()
     return out
+
+
+def query_daily_tmax_observations(
+    *,
+    stations: Sequence[str] | None,
+    obs_dsn: str | None,
+    logger: logging.Logger,
+) -> pd.DataFrame:
+    if not OBS_QUERY_HELPER.exists():
+        raise FileNotFoundError(f"Observation query helper script not found: {OBS_QUERY_HELPER}")
+
+    cmd = [sys.executable, str(OBS_QUERY_HELPER)]
+    if obs_dsn:
+        cmd.extend(["--obs-dsn", obs_dsn])
+    if stations:
+        for station in stations:
+            cmd.extend(["--station", str(station)])
+
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode != 0:
+        stderr = proc.stderr.strip() or "<no stderr>"
+        raise RuntimeError(
+            "Observation query helper failed "
+            f"(exit={proc.returncode}) for stations={stations}: {stderr}"
+        )
+
+    payload = proc.stdout.strip()
+    if not payload:
+        logger.warning("Observation query helper returned empty output for stations=%s", stations)
+        return pd.DataFrame(columns=["city_name", "target_date_local", "tmax_obs_c"])
+
+    try:
+        records = json.loads(payload)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            "Observation query helper returned invalid JSON "
+            f"for stations={stations}: {payload[:200]!r}"
+        ) from exc
+
+    if not isinstance(records, list):
+        raise RuntimeError(
+            "Observation query helper returned unexpected payload type: "
+            f"{type(records).__name__}"
+        )
+    return pd.DataFrame.from_records(records)
 
 
 def parse_step_range(step_range: str | int | float | None) -> tuple[float | None, float | None]:
@@ -1408,7 +1457,7 @@ def main(argv: list[str]) -> int:
     archive_root = Path(args.archive_root).expanduser().resolve()
     stations_csv = Path(args.stations_csv).expanduser().resolve()
     obs_root = Path(args.obs_root).expanduser().resolve()
-    obs_dsn = resolve_master_postgres_dsn(explicit_dsn=args.obs_dsn)
+    obs_dsn = args.obs_dsn
     train_root = Path(args.train_root).expanduser().resolve()
 
     if not archive_root.exists():

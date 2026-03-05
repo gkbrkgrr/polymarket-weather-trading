@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 from datetime import datetime, timezone
@@ -30,6 +31,11 @@ class ClobClient:
         self.run_id = run_id
         self.snapshot_interval_seconds = snapshot_interval_seconds
         self._last_snapshot: dict[tuple[str, int | None], datetime] = {}
+        self._last_quote: dict[
+            tuple[str, int | None],
+            tuple[Decimal | None, Decimal | None, Decimal | None, Decimal | None],
+        ] = {}
+        self._subscribed_assets: set[str] = set()
         self._logger = logging.getLogger(__name__)
 
     async def run(self, token_map: dict[str, tuple[str, int | None]]) -> None:
@@ -40,16 +46,49 @@ class ClobClient:
 
         self._logger.info("Starting CLOB websocket to %s", self.ws_url)
         async with websockets.connect(self.ws_url, ping_interval=20, ping_timeout=20) as ws:
-            await self._subscribe(ws, token_map)
-            while True:
-                raw_msg = await ws.recv()
-                await self._handle_message(raw_msg, token_map)
+            heartbeat_task = asyncio.create_task(self._heartbeat(ws))
+            try:
+                await self._subscribe(ws, token_map)
+                while True:
+                    try:
+                        raw_msg = await asyncio.wait_for(ws.recv(), timeout=1.0)
+                    except asyncio.TimeoutError:
+                        await self._subscribe(ws, token_map)
+                        continue
+                    await self._handle_message(raw_msg, token_map)
+                    await self._subscribe(ws, token_map)
+            finally:
+                heartbeat_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await heartbeat_task
+
+    async def _heartbeat(self, ws) -> None:
+        while True:
+            await asyncio.sleep(10)
+            await ws.send("PING")
 
     async def _subscribe(self, ws, token_map: dict[str, tuple[str, int | None]]) -> None:
-        self._logger.info("Subscribing to %d CLOB books", len(token_map))
-        for token_id in token_map.keys():
-            payload = {"type": "subscribe", "channel": "book", "market": token_id}
+        new_asset_ids = [token_id for token_id in token_map.keys() if token_id not in self._subscribed_assets]
+        if not new_asset_ids:
+            return
+
+        self._logger.info("Subscribing to %d CLOB books", len(new_asset_ids))
+        chunks = _chunked(new_asset_ids, size=500)
+        for idx, chunk in enumerate(chunks):
+            if idx == 0 and not self._subscribed_assets:
+                payload = {
+                    "assets_ids": chunk,
+                    "type": "market",
+                    "custom_feature_enabled": True,
+                }
+            else:
+                payload = {
+                    "assets_ids": chunk,
+                    "operation": "subscribe",
+                    "custom_feature_enabled": True,
+                }
             await ws.send(json.dumps(payload))
+        self._subscribed_assets.update(new_asset_ids)
 
     async def _handle_message(
         self, raw_msg: Any, token_map: dict[str, tuple[str, int | None]]
@@ -88,6 +127,9 @@ class ClobClient:
 
         outcome_index, best_bid, best_ask, bid_size, ask_size = snapshot
         key = (market_id, outcome_index)
+        current_quote = (best_bid, best_ask, bid_size, ask_size)
+        if not _quote_changed(current_quote, self._last_quote.get(key)):
+            return
         if not _should_write(ts, self._last_snapshot.get(key), self.snapshot_interval_seconds):
             return
 
@@ -102,6 +144,7 @@ class ClobClient:
             raw=message,
         )
         self._last_snapshot[key] = ts
+        self._last_quote[key] = current_quote
 
 
 def _extract_ts(message: dict[str, Any]) -> datetime:
@@ -128,6 +171,8 @@ def _extract_token_id(message: dict[str, Any]) -> str | None:
     return (
         data.get("tokenId")
         or data.get("token_id")
+        or data.get("asset_id")
+        or data.get("assetId")
         or data.get("asset")
         or data.get("market")
     )
@@ -140,11 +185,25 @@ def _extract_snapshot(
     data = message.get("data") if isinstance(message.get("data"), dict) else message
     bids = data.get("bids") or data.get("bid") or []
     asks = data.get("asks") or data.get("ask") or []
-    if not bids and not asks:
-        return None
-
-    best_bid, bid_size = _best_level(bids, prefer_max=True)
-    best_ask, ask_size = _best_level(asks, prefer_max=False)
+    best_bid = None
+    best_ask = None
+    bid_size = None
+    ask_size = None
+    if bids or asks:
+        best_bid, bid_size = _best_level(bids, prefer_max=True)
+        best_ask, ask_size = _best_level(asks, prefer_max=False)
+    else:
+        # best_bid_ask style payloads may carry only top-of-book fields.
+        best_bid = coerce_decimal(data.get("best_bid") or data.get("bestBid") or data.get("bid"))
+        best_ask = coerce_decimal(data.get("best_ask") or data.get("bestAsk") or data.get("ask"))
+        bid_size = coerce_decimal(
+            data.get("best_bid_size") or data.get("bestBidSize") or data.get("bid_size")
+        )
+        ask_size = coerce_decimal(
+            data.get("best_ask_size") or data.get("bestAskSize") or data.get("ask_size")
+        )
+        if best_bid is None and best_ask is None:
+            return None
     outcome_index = data.get("outcomeIndex") or data.get("outcome_index") or default_outcome_index
     if outcome_index is not None:
         try:
@@ -187,6 +246,21 @@ def _should_write(ts: datetime, last_ts: datetime | None, interval_seconds: int)
     return (ts - last_ts).total_seconds() >= interval_seconds
 
 
+def _chunked(values: list[str], size: int) -> list[list[str]]:
+    if size < 1:
+        raise ValueError("chunk size must be >= 1")
+    return [values[i : i + size] for i in range(0, len(values), size)]
+
+
+def _quote_changed(
+    current: tuple[Decimal | None, Decimal | None, Decimal | None, Decimal | None],
+    previous: tuple[Decimal | None, Decimal | None, Decimal | None, Decimal | None] | None,
+) -> bool:
+    if previous is None:
+        return True
+    return current != previous
+
+
 class ClobRestClient:
     def __init__(
         self,
@@ -210,6 +284,10 @@ class ClobRestClient:
         self.snapshot_interval_seconds = snapshot_interval_seconds
         self.concurrency = max(1, concurrency)
         self._last_snapshot: dict[tuple[str, int | None], datetime] = {}
+        self._last_quote: dict[
+            tuple[str, int | None],
+            tuple[Decimal | None, Decimal | None, Decimal | None, Decimal | None],
+        ] = {}
         self._skip_tokens: dict[str, datetime] = {}
         self._logger = logging.getLogger(__name__)
 
@@ -251,6 +329,9 @@ class ClobRestClient:
                     return
                 snap_outcome, best_bid, best_ask, bid_size, ask_size = snapshot
                 key = (market_id, snap_outcome)
+                current_quote = (best_bid, best_ask, bid_size, ask_size)
+                if not _quote_changed(current_quote, self._last_quote.get(key)):
+                    return
                 if not _should_write(
                     ts, self._last_snapshot.get(key), self.snapshot_interval_seconds
                 ):
@@ -266,6 +347,7 @@ class ClobRestClient:
                     raw=payload,
                 )
                 self._last_snapshot[key] = ts
+                self._last_quote[key] = current_quote
 
         tasks = [
             _fetch(token_id, market_id, outcome_index)

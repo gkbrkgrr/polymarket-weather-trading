@@ -149,7 +149,7 @@ def build_commands(
         ]
     )
 
-    for model_name in ("xgb", "xgb_opt"):
+    for model_name in ("city_extended", "xgb_opt_v1_100", "xgb_opt_v2_100"):
         cmd = [
             str(python_bin),
             str(scripts_dir / "daily_station_tmax_predictor.py"),
