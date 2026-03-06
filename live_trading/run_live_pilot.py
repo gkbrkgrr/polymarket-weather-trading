@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import re
 import sys
 import time
@@ -43,6 +44,14 @@ from live_trading.utils_time import (
 
 STRIKE_SUFFIX_RE = re.compile(r"-(?:neg-\d+|\d+)c(?:orbelow|orhigher)?$|-(?:\d+-\d+f|\d+forbelow|\d+forhigher|\d+f)$")
 CYCLE_TOKEN_RE = re.compile(r"^\d{10}$")
+SLUG_PREFIX_RE = re.compile(r"^highest-temperature-in-([a-z0-9-]+)-on-")
+SLUG_EXACT_C_RE = re.compile(r"-(neg-\d+|\d+)c$")
+SLUG_BELOW_C_RE = re.compile(r"-(neg-\d+|\d+)corbelow$")
+SLUG_ABOVE_C_RE = re.compile(r"-(neg-\d+|\d+)corhigher$")
+SLUG_RANGE_F_RE = re.compile(r"-(\d+)-(\d+)f$")
+SLUG_BELOW_F_RE = re.compile(r"-(\d+)forbelow$")
+SLUG_ABOVE_F_RE = re.compile(r"-(\d+)forhigher$")
+SLUG_EXACT_F_RE = re.compile(r"-(\d+)f$")
 GENERIC_DIR_NAMES = {
     "reports",
     "report",
@@ -72,6 +81,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "max_snapshot_age_minutes": 30,
     "pause_on_stale_probabilities": True,
     "pause_on_stale_snapshots": True,
+    "health_gate_alert_cooldown_minutes": 30,
     "top_n_per_event_day": 2,
     "stake_fraction": 0.005,
     "stake_cap_usd": 50,
@@ -109,6 +119,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--config", type=Path, required=True, help="Path to YAML config.")
     parser.add_argument("--dry-run", action="store_true", help="Only evaluate policy and log WOULD-trade decisions.")
     parser.add_argument("--once", action="store_true", help="Run a single cycle and exit.")
+    parser.add_argument(
+        "--exit-nonzero-on-cycle-failure",
+        action="store_true",
+        help="Return exit code 1 when a cycle raises an exception (useful for external supervisors).",
+    )
     parser.add_argument(
         "command",
         nargs="?",
@@ -349,6 +364,242 @@ def _derive_station_from_source_path(source_path: str) -> str | None:
     if normalize_station_key(stem):
         return stem
     return None
+
+
+def _parse_c_token(token: str) -> int:
+    if token.startswith("neg-"):
+        return -int(token.split("-", 1)[1])
+    return int(token)
+
+
+def _f_to_c(value_f: float) -> float:
+    return (float(value_f) - 32.0) * (5.0 / 9.0)
+
+
+def _round_market_integer_c(value_c: float) -> int:
+    return int(math.floor(float(value_c) + 0.5))
+
+
+def _parse_open_market_slug(slug: str, station_lookup: dict[str, str]) -> dict[str, Any] | None:
+    text = str(slug or "").strip().lower()
+    m = SLUG_PREFIX_RE.search(text)
+    if m is None:
+        return None
+
+    station_key = normalize_station_key(m.group(1))
+    station = station_lookup.get(station_key)
+    if station is None:
+        return None
+
+    strike_k: int | None = None
+    m_below_c = SLUG_BELOW_C_RE.search(text)
+    m_above_c = SLUG_ABOVE_C_RE.search(text)
+    m_exact_c = SLUG_EXACT_C_RE.search(text)
+    m_range_f = SLUG_RANGE_F_RE.search(text)
+    m_below_f = SLUG_BELOW_F_RE.search(text)
+    m_above_f = SLUG_ABOVE_F_RE.search(text)
+    m_exact_f = SLUG_EXACT_F_RE.search(text)
+
+    if m_below_c:
+        strike_k = _parse_c_token(m_below_c.group(1))
+    elif m_above_c:
+        strike_k = _parse_c_token(m_above_c.group(1))
+    elif m_exact_c:
+        strike_k = _parse_c_token(m_exact_c.group(1))
+    elif m_range_f:
+        low_f = int(m_range_f.group(1))
+        high_f = int(m_range_f.group(2))
+        if low_f > high_f:
+            low_f, high_f = high_f, low_f
+        strike_k = _round_market_integer_c(_f_to_c((low_f + high_f) / 2.0))
+    elif m_below_f:
+        strike_k = _round_market_integer_c(_f_to_c(float(m_below_f.group(1))))
+    elif m_above_f:
+        strike_k = _round_market_integer_c(_f_to_c(float(m_above_f.group(1))))
+    elif m_exact_f:
+        strike_k = _round_market_integer_c(_f_to_c(float(m_exact_f.group(1))))
+
+    if strike_k is None:
+        return None
+
+    event_key = _derive_event_key(text)
+    return {
+        "station": station,
+        "station_key": station_key,
+        "event_key": event_key,
+        "strike_k": int(strike_k),
+    }
+
+
+def _to_day_iso(value: Any) -> str | None:
+    ts = pd.to_datetime(value, errors="coerce")
+    if pd.isna(ts):
+        return None
+    return ts.date().isoformat()
+
+
+def resolve_open_market_universe(
+    *,
+    universe: pd.DataFrame,
+    conn: psycopg.Connection,
+    station_tz: dict[str, str],
+    cfg: dict[str, Any],
+    logger: logging.Logger,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    out = universe.copy()
+    if out.empty:
+        return out, out
+
+    station_lookup: dict[str, str] = {}
+    for station in out["station"].dropna().astype(str):
+        key = normalize_station_key(station)
+        if key and key not in station_lookup:
+            station_lookup[key] = station
+
+    open_markets = dbmod.fetch_open_weather_markets(conn, statuses=["active"])
+    if open_markets.empty:
+        unmapped = out.copy()
+        unmapped["unmapped_reason"] = "open_market_universe_empty"
+        logger.warning("Open market universe is empty; dropping %d candidate rows", len(unmapped))
+        return out.iloc[0:0].copy(), unmapped
+
+    default_tz = str(cfg.get("timezones", {}).get("default", "UTC"))
+    market_rows: list[dict[str, Any]] = []
+    for row in open_markets.itertuples(index=False):
+        slug = str(row.slug or "").strip()
+        parsed = _parse_open_market_slug(slug, station_lookup=station_lookup)
+        if parsed is None:
+            continue
+
+        end_date_utc = pd.to_datetime(row.end_date_utc, utc=True, errors="coerce")
+        if pd.isna(end_date_utc):
+            continue
+        station = str(parsed["station"])
+        tz = station_tz.get(station, default_tz)
+        market_day_local = end_date_utc.tz_convert(tz).tz_localize(None).date().isoformat()
+
+        market_rows.append(
+            {
+                "market_id": str(row.market_id),
+                "slug": slug,
+                "asset_id": None if pd.isna(getattr(row, "asset_id", pd.NA)) else str(getattr(row, "asset_id")),
+                "station_key": str(parsed["station_key"]),
+                "event_key": str(parsed["event_key"]).strip().lower(),
+                "strike_k": int(parsed["strike_k"]),
+                "market_day_local": market_day_local,
+            }
+        )
+
+    if not market_rows:
+        unmapped = out.copy()
+        unmapped["unmapped_reason"] = "open_market_parsing_empty"
+        logger.warning("Open market universe parsing yielded zero rows; dropping %d candidate rows", len(unmapped))
+        return out.iloc[0:0].copy(), unmapped
+
+    market_idx = pd.DataFrame.from_records(market_rows)
+    market_idx = market_idx.sort_values(["market_id"], ascending=[False], kind="mergesort")
+
+    by_market_id: dict[str, dict[str, Any]] = {
+        str(r.market_id): r._asdict() for r in market_idx.itertuples(index=False)
+    }
+    by_slug: dict[str, dict[str, Any]] = {
+        str(r.slug): r._asdict() for r in market_idx.itertuples(index=False)
+    }
+    by_key: dict[tuple[str, str, str, int], dict[str, Any]] = {}
+    duplicate_keys = 0
+    for rec in market_idx.to_dict(orient="records"):
+        key = (
+            str(rec["station_key"]),
+            str(rec["market_day_local"]),
+            str(rec["event_key"]),
+            int(rec["strike_k"]),
+        )
+        if key in by_key:
+            duplicate_keys += 1
+            continue
+        by_key[key] = rec
+    if duplicate_keys > 0:
+        logger.warning("Open market universe contains %d duplicate station/day/event/strike keys", duplicate_keys)
+
+    mapped_records: list[dict[str, Any]] = []
+    unmapped_records: list[dict[str, Any]] = []
+    for row in out.itertuples(index=False):
+        rec = row._asdict()
+        raw_market_id = None if pd.isna(rec.get("market_id")) else str(rec.get("market_id")).strip()
+        raw_slug = None if pd.isna(rec.get("slug")) else str(rec.get("slug")).strip()
+        station = str(rec.get("station") or "").strip()
+        station_key = normalize_station_key(station)
+        event_key_raw = None if pd.isna(rec.get("event_key")) else str(rec.get("event_key")).strip()
+        if not event_key_raw and raw_slug:
+            event_key_raw = _derive_event_key(raw_slug)
+        event_key = str(event_key_raw).strip().lower() if event_key_raw else ""
+
+        day_iso = _to_day_iso(rec.get("market_day_local"))
+        strike_k: int | None
+        try:
+            strike_k = int(rec.get("strike_k"))
+        except Exception:
+            strike_k = None
+
+        mapped_market: dict[str, Any] | None = None
+        fallback_reason: str | None = None
+
+        if raw_market_id:
+            mapped_market = by_market_id.get(raw_market_id)
+            if mapped_market is None:
+                fallback_reason = "market_id_not_open"
+
+        if mapped_market is None and raw_slug:
+            mapped_market = by_slug.get(raw_slug)
+            if mapped_market is None and fallback_reason is None:
+                fallback_reason = "slug_not_open"
+
+        if mapped_market is None:
+            if not station_key:
+                fallback_reason = fallback_reason or "missing_station"
+            elif not day_iso:
+                fallback_reason = fallback_reason or "invalid_market_day_local"
+            elif strike_k is None:
+                fallback_reason = fallback_reason or "invalid_strike_k"
+            elif not event_key:
+                fallback_reason = fallback_reason or "missing_event_key"
+            else:
+                mapped_market = by_key.get((station_key, day_iso, event_key, strike_k))
+                if mapped_market is None and fallback_reason is None:
+                    fallback_reason = "no_station_day_strike_match"
+
+        if mapped_market is None:
+            rec["unmapped_reason"] = fallback_reason or "unmapped"
+            unmapped_records.append(rec)
+            continue
+
+        rec["market_id"] = mapped_market.get("market_id")
+        rec["slug"] = mapped_market.get("slug") or rec.get("slug")
+        rec["asset_id"] = mapped_market.get("asset_id")
+        mapped_records.append(rec)
+
+    mapped = pd.DataFrame.from_records(mapped_records)
+    if mapped.empty:
+        mapped = out.iloc[0:0].copy()
+    unmapped = pd.DataFrame.from_records(unmapped_records)
+
+    if not unmapped.empty:
+        counts = unmapped["unmapped_reason"].astype(str).value_counts().to_dict()
+        logger.warning("Unmapped probability rows dropped: count=%d reason_counts=%s", len(unmapped), counts)
+        for row in unmapped.head(20).itertuples(index=False):
+            logger.warning(
+                "Unmapped row reason=%s station=%s day=%s strike_k=%s event_key=%s slug=%s market_id=%s",
+                getattr(row, "unmapped_reason", ""),
+                getattr(row, "station", ""),
+                getattr(row, "market_day_local", ""),
+                getattr(row, "strike_k", ""),
+                getattr(row, "event_key", ""),
+                getattr(row, "slug", ""),
+                getattr(row, "market_id", ""),
+            )
+    else:
+        logger.info("All universe rows mapped to open markets via master_db")
+    return mapped, unmapped
 
 
 def read_probability_files(path: Path) -> pd.DataFrame:
@@ -781,6 +1032,37 @@ def _evaluate_runtime_health_gate(
     return reasons
 
 
+def _should_emit_health_gate_alert(
+    *,
+    state_store: PilotStateStore,
+    reason_text: str,
+    now_utc: datetime,
+    cooldown_minutes: float,
+) -> bool:
+    runtime_alerts = state_store.state.setdefault("runtime_alerts", {})
+    last = runtime_alerts.get("health_gate_alert")
+    if not isinstance(last, dict):
+        last = {}
+        runtime_alerts["health_gate_alert"] = last
+
+    last_reason = str(last.get("reason", ""))
+    last_sent_raw = last.get("sent_at_utc")
+    last_sent = pd.to_datetime(last_sent_raw, utc=True, errors="coerce")
+    cooldown_seconds = max(0.0, float(cooldown_minutes) * 60.0)
+
+    if (
+        bool(reason_text)
+        and reason_text == last_reason
+        and (not pd.isna(last_sent))
+        and (now_utc - last_sent.to_pydatetime()).total_seconds() < cooldown_seconds
+    ):
+        return False
+
+    last["reason"] = str(reason_text)
+    last["sent_at_utc"] = now_utc.isoformat()
+    return True
+
+
 def _build_health_gate_blocked_policy(
     candidates: pd.DataFrame,
     *,
@@ -899,12 +1181,19 @@ def run_cycle(
     health_gate_reason_text = "; ".join(gate_reasons)
     if health_gate_blocked:
         logger.error("Trading paused by health gate: %s", health_gate_reason_text)
-        if notifier is not None:
+        if notifier is not None and _should_emit_health_gate_alert(
+            state_store=state_store,
+            reason_text=health_gate_reason_text,
+            now_utc=now,
+            cooldown_minutes=float(cfg.get("health_gate_alert_cooldown_minutes", 30)),
+        ):
             notifier.notify_alert(
                 f"Live pilot paused: {health_gate_reason_text}",
                 logger=logger,
                 channel="trades",
             )
+        elif notifier is not None:
+            logger.info("Suppressed duplicate health gate alert within cooldown window")
 
     stations = [str(s).strip() for s in cfg.get("stations_allowlist", []) if str(s).strip()]
     station_tz = build_station_timezone_map(cfg, stations)
@@ -914,25 +1203,16 @@ def run_cycle(
         logger.info("No probability rows in live universe after station/date/cutoff filters")
         return
 
-    metadata = dbmod.fetch_market_metadata(
-        conn,
-        slugs=universe["slug"].dropna().astype(str).unique().tolist(),
-        market_ids=universe["market_id"].dropna().astype(str).unique().tolist(),
+    universe, _unmapped = resolve_open_market_universe(
+        universe=universe,
+        conn=conn,
+        station_tz=station_tz,
+        cfg=cfg,
+        logger=logger,
     )
-    if not metadata.empty:
-        universe = universe.merge(metadata[["market_id", "slug", "asset_id"]], on=["market_id", "slug"], how="left", suffixes=("", "_meta"))
-        if "asset_id_meta" in universe.columns:
-            universe["asset_id"] = universe.get("asset_id", pd.Series([pd.NA] * len(universe), dtype="string")).fillna(universe["asset_id_meta"])
-            universe = universe.drop(columns=["asset_id_meta"], errors="ignore")
-    else:
-        universe["asset_id"] = pd.Series([pd.NA] * len(universe), dtype="string")
-
-    missing_mid = universe["market_id"].isna()
-    if missing_mid.any() and not metadata.empty:
-        slug_to_market = metadata.dropna(subset=["slug", "market_id"]).drop_duplicates("slug").set_index("slug")["market_id"].to_dict()
-        slug_to_asset = metadata.dropna(subset=["slug"]).drop_duplicates("slug").set_index("slug")["asset_id"].to_dict()
-        universe.loc[missing_mid, "market_id"] = universe.loc[missing_mid, "slug"].map(slug_to_market)
-        universe.loc[universe["asset_id"].isna(), "asset_id"] = universe.loc[universe["asset_id"].isna(), "slug"].map(slug_to_asset)
+    if universe.empty:
+        logger.info("No mapped rows in open-market universe after resolver")
+        return
 
     market_ids = sorted(universe["market_id"].dropna().astype(str).unique().tolist())
     snapshot_df = dbmod.fetch_latest_snapshots(conn, snapshot_table=snapshot_info, market_ids=market_ids)
@@ -1182,48 +1462,99 @@ def main(argv: list[str] | None = None) -> int:
 
     logger.info("Starting live pilot run_id=%s mode=%s dry_run=%s", run_id, cfg.get("mode"), args.dry_run)
 
+    state_store = PilotStateStore(output_dir / "state", nav_usd=float(cfg.get("nav_usd", 10000)))
+    notifier = TelegramNotifier.from_config(
+        cfg=cfg,
+        repo_root=REPO_ROOT,
+        send_enabled=(not bool(args.dry_run)),
+        logger=logger,
+    )
+
+    conn: psycopg.Connection | None = None
+    snapshot_info: dbmod.SnapshotTableInfo | None = None
+
     try:
-        with dbmod.connect_db(str(cfg.get("db_dsn"))) as conn:
-            dbmod.ensure_live_pilot_tables(conn)
-            snapshot_info = dbmod.detect_snapshot_table(conn)
+        while True:
+            cycle_started = utc_now()
 
-            state_store = PilotStateStore(output_dir / "state", nav_usd=float(cfg.get("nav_usd", 10000)))
-            notifier = TelegramNotifier.from_config(
-                cfg=cfg,
-                repo_root=REPO_ROOT,
-                send_enabled=(not bool(args.dry_run)),
-                logger=logger,
-            )
-
-            while True:
-                cycle_started = utc_now()
+            if conn is None or bool(getattr(conn, "closed", False)):
                 try:
-                    run_cycle(
-                        cfg=cfg,
-                        run_id=run_id,
-                        logger=logger,
-                        state_store=state_store,
-                        output_dir=output_dir,
-                        dry_run=bool(args.dry_run),
-                        conn=conn,
-                        snapshot_info=snapshot_info,
-                        notifier=notifier,
-                    )
+                    conn = dbmod.connect_db(str(cfg.get("db_dsn")))
+                    dbmod.ensure_live_pilot_tables(conn)
+                    snapshot_info = dbmod.detect_snapshot_table(conn)
+                    logger.info("DB connection ready snapshot_table=%s", snapshot_info.table_name)
                 except Exception as exc:
-                    logger.error("Cycle failure: %s", exc)
+                    logger.error("DB setup failure: %s", exc)
                     logger.error(traceback.format_exc())
+                    if conn is not None:
+                        try:
+                            conn.close()
+                        except Exception:
+                            pass
+                    conn = None
+                    snapshot_info = None
+                    if bool(args.exit_nonzero_on_cycle_failure):
+                        logger.error("Exiting with non-zero due to --exit-nonzero-on-cycle-failure")
+                        return 1
+                    if args.once:
+                        return 1
 
-                if args.once:
-                    break
+                    wait_s = max(1.0, float(cfg.get("run_interval_minutes", 10)) * 60.0)
+                    logger.info("Sleeping %.1f seconds before DB reconnect attempt", wait_s)
+                    time.sleep(wait_s)
+                    continue
 
-                elapsed = (utc_now() - cycle_started).total_seconds()
-                wait_s = max(1.0, float(cfg.get("run_interval_minutes", 10)) * 60.0 - elapsed)
-                logger.info("Cycle complete. Sleeping %.1f seconds", wait_s)
-                time.sleep(wait_s)
+            try:
+                if snapshot_info is None:
+                    raise RuntimeError("snapshot_info unavailable")
+                run_cycle(
+                    cfg=cfg,
+                    run_id=run_id,
+                    logger=logger,
+                    state_store=state_store,
+                    output_dir=output_dir,
+                    dry_run=bool(args.dry_run),
+                    conn=conn,
+                    snapshot_info=snapshot_info,
+                    notifier=notifier,
+                )
+            except psycopg.Error as exc:
+                logger.error("Cycle DB failure: %s", exc)
+                logger.error(traceback.format_exc())
+                if conn is not None:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                conn = None
+                snapshot_info = None
+                if bool(args.exit_nonzero_on_cycle_failure):
+                    logger.error("Exiting with non-zero due to --exit-nonzero-on-cycle-failure")
+                    return 1
+            except Exception as exc:
+                logger.error("Cycle failure: %s", exc)
+                logger.error(traceback.format_exc())
+                if bool(args.exit_nonzero_on_cycle_failure):
+                    logger.error("Exiting with non-zero due to --exit-nonzero-on-cycle-failure")
+                    return 1
+
+            if args.once:
+                break
+
+            elapsed = (utc_now() - cycle_started).total_seconds()
+            wait_s = max(1.0, float(cfg.get("run_interval_minutes", 10)) * 60.0 - elapsed)
+            logger.info("Cycle complete. Sleeping %.1f seconds", wait_s)
+            time.sleep(wait_s)
 
     except KeyboardInterrupt:
         logger.info("Interrupted by user")
         return 0
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
     return 0
 

@@ -193,6 +193,51 @@ def fetch_market_metadata(
     return out
 
 
+def fetch_open_weather_markets(
+    conn: psycopg.Connection,
+    *,
+    statuses: list[str] | None = None,
+) -> pd.DataFrame:
+    status_list = [str(s).strip() for s in (statuses or ["active"]) if str(s).strip()]
+    if not status_list:
+        status_list = ["active"]
+
+    query = """
+        SELECT
+            m.market_id::text AS market_id,
+            m.slug,
+            m.status,
+            m.resolution_time,
+            m.raw ->> 'endDate' AS end_date_utc,
+            m.raw,
+            o.outcome_id::text AS no_outcome_id
+        FROM markets m
+        LEFT JOIN outcomes o
+          ON o.market_id = m.market_id
+         AND o.outcome_index = 1
+        WHERE m.status = ANY(%(statuses)s::text[])
+          AND m.slug ILIKE 'highest-temperature-in-%%'
+    """
+    out = fetch_dataframe(conn, query, params={"statuses": status_list})
+    if out.empty:
+        return out
+
+    out["asset_id"] = out["no_outcome_id"].astype("string")
+    missing = out["asset_id"].isna() | (out["asset_id"].astype("string").str.strip() == "")
+    if missing.any():
+        out.loc[missing, "asset_id"] = out.loc[missing, "raw"].map(_extract_asset_id_from_raw)
+
+    out["market_id"] = out["market_id"].astype("string")
+    out["slug"] = out["slug"].astype("string")
+    out["status"] = out["status"].astype("string")
+    out["asset_id"] = out["asset_id"].astype("string")
+    out["resolution_time"] = pd.to_datetime(out["resolution_time"], utc=True, errors="coerce")
+    out["end_date_utc"] = pd.to_datetime(out["end_date_utc"], utc=True, errors="coerce")
+    out = out.drop(columns=["raw", "no_outcome_id"], errors="ignore")
+    out = out.drop_duplicates(subset=["market_id"], keep="last")
+    return out
+
+
 def fetch_latest_snapshots(
     conn: psycopg.Connection,
     *,

@@ -23,6 +23,7 @@ SKIP_REASONS = {
     "price_too_high",
     "risk_limit_hit",
     "max_positions_hit",
+    "already_open_position",
     "outside_trade_window",
     "kill_switch_active",
 }
@@ -152,12 +153,32 @@ def apply_policy(
     portfolio_added_risk: dict[str, float] = {}
     station_added_positions: dict[tuple[str, str], int] = {}
     added_positions_total_by_day: dict[str, int] = {}
+    open_position_keys: set[str] = set()
+    cycle_added_position_keys: set[str] = set()
+
+    for pos in state_store.open_positions():
+        if str(pos.get("status", "open")) != "open":
+            continue
+        market_id = str(pos.get("market_id") or "").strip()
+        slug = str(pos.get("slug") or "").strip()
+        if market_id:
+            open_position_keys.add(f"mid:{market_id}")
+        elif slug:
+            open_position_keys.add(f"slug:{slug}")
 
     for idx in sorted(selected_idx, key=lambda i: float(df.at[i, "edge"]), reverse=True):
         row = df.loc[idx]
         station = str(row["station"])
         day_local = str(pd.to_datetime(row["market_day_local"]).date())
         stake_usd = float(row["stake_usd"])
+        market_id = str(row.get("market_id") or "").strip()
+        slug = str(row.get("slug") or "").strip()
+        position_key = f"mid:{market_id}" if market_id else (f"slug:{slug}" if slug else "")
+
+        if position_key and (position_key in open_position_keys or position_key in cycle_added_position_keys):
+            df.at[idx, "decision"] = "SKIP"
+            df.at[idx, "skipped_reason"] = "already_open_position"
+            continue
 
         station_key = (day_local, station)
         added_station_risk = station_added_risk.get(station_key, 0.0)
@@ -204,6 +225,8 @@ def apply_policy(
         portfolio_added_risk[day_local] = added_portfolio + stake_usd
         station_added_positions[station_key] = added_station_positions + 1
         added_positions_total_by_day[day_local] = added_total_positions + 1
+        if position_key:
+            cycle_added_position_keys.add(position_key)
 
     df = df.drop(columns=["_pre_pass"], errors="ignore")
     return df

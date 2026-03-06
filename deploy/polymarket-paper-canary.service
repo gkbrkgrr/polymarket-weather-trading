@@ -1,0 +1,15 @@
+[Unit]
+Description=Polymarket Weather Paper Trading Canary (LT-11)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/polymarket-weather-trading
+ExecStart=/opt/polymarket-weather-trading/.venv/bin/python /opt/polymarket-weather-trading/scripts/run_paper_trading_canary.py --config /opt/polymarket-weather-trading/live_trading/config.live_pilot.yaml --duration-days 14
+Restart=on-failure
+RestartSec=30
+RestartPreventExitStatus=1 130
+
+[Install]
+WantedBy=multi-user.target
