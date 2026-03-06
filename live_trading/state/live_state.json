@@ -4,61 +4,61 @@
     "2026-03-06": {
       "portfolio_pnl_realized": 0.0,
       "portfolio_risk_used": 7.909999999999998,
-      "skip_count": 25860,
+      "skip_count": 96609,
       "stations": {
         "Ankara": {
           "pnl_realized": 0.0,
           "risk_used": 0.0,
-          "skips": 2676,
+          "skips": 8858,
           "stoploss_triggered": false,
           "trades": 0
         },
         "Atlanta": {
           "pnl_realized": 0.0,
           "risk_used": 0.0,
-          "skips": 3568,
+          "skips": 13944,
           "stoploss_triggered": false,
           "trades": 0
         },
         "Chicago": {
           "pnl_realized": 0.0,
           "risk_used": 2.5912499999999996,
-          "skips": 4011,
+          "skips": 15684,
           "stoploss_triggered": false,
           "trades": 3
         },
         "Dallas": {
           "pnl_realized": 0.0,
           "risk_used": 3.34125,
-          "skips": 4011,
+          "skips": 15684,
           "stoploss_triggered": false,
           "trades": 3
         },
         "SaoPaulo": {
           "pnl_realized": 0.0,
           "risk_used": 1.9775,
-          "skips": 4012,
+          "skips": 15685,
           "stoploss_triggered": false,
           "trades": 2
         },
         "Seattle": {
           "pnl_realized": 0.0,
           "risk_used": 0.0,
-          "skips": 4014,
+          "skips": 12810,
           "stoploss_triggered": false,
           "trades": 0
         },
         "Seoul": {
           "pnl_realized": 0.0,
           "risk_used": 0.0,
-          "skips": 1784,
+          "skips": 6972,
           "stoploss_triggered": false,
           "trades": 0
         },
         "Toronto": {
           "pnl_realized": 0.0,
           "risk_used": 0.0,
-          "skips": 1784,
+          "skips": 6972,
           "stoploss_triggered": false,
           "trades": 0
         }
@@ -68,61 +68,61 @@
     "2026-03-07": {
       "portfolio_pnl_realized": 0.0,
       "portfolio_risk_used": 11.44,
-      "skip_count": 32100,
+      "skip_count": 125484,
       "stations": {
         "Ankara": {
           "pnl_realized": 0.0,
           "risk_used": 0.0,
-          "skips": 4014,
+          "skips": 15687,
           "stoploss_triggered": false,
           "trades": 0
         },
         "Atlanta": {
           "pnl_realized": 0.0,
           "risk_used": 4.305,
-          "skips": 4010,
+          "skips": 15683,
           "stoploss_triggered": false,
           "trades": 4
         },
         "Chicago": {
           "pnl_realized": 0.0,
           "risk_used": 0.0,
-          "skips": 4014,
+          "skips": 15687,
           "stoploss_triggered": false,
           "trades": 0
         },
         "Dallas": {
           "pnl_realized": 0.0,
           "risk_used": 0.0,
-          "skips": 4014,
+          "skips": 15687,
           "stoploss_triggered": false,
           "trades": 0
         },
         "SaoPaulo": {
           "pnl_realized": 0.0,
           "risk_used": 2.8287500000000003,
-          "skips": 4011,
+          "skips": 15684,
           "stoploss_triggered": false,
           "trades": 3
         },
         "Seattle": {
           "pnl_realized": 0.0,
           "risk_used": 1.07625,
-          "skips": 4013,
+          "skips": 15686,
           "stoploss_triggered": false,
           "trades": 1
         },
         "Seoul": {
           "pnl_realized": 0.0,
           "risk_used": 0.0,
-          "skips": 4014,
+          "skips": 15687,
           "stoploss_triggered": false,
           "trades": 0
         },
         "Toronto": {
           "pnl_realized": 0.0,
           "risk_used": 3.2299999999999995,
-          "skips": 4010,
+          "skips": 15683,
           "stoploss_triggered": false,
           "trades": 4
         }
@@ -135,6 +135,7 @@
     "station_paused": {}
   },
   "last_report_date_local": null,
+  "nav_peak_usd": 250.0,
   "nav_usd": 250.0,
   "open_positions": [
     {
@@ -498,6 +499,7 @@
       "strike_k": 28
     }
   ],
+  "recent_order_keys": [],
   "stoploss": {
     "consecutive_days_hit": 0,
     "history": [
@@ -508,6 +510,7 @@
       }
     ]
   },
-  "updated_at_utc": "2026-03-06T10:42:16.568106+00:00",
+  "trade_cooldowns": {},
+  "updated_at_utc": "2026-03-06T12:51:59.743108+00:00",
   "version": 1
 }

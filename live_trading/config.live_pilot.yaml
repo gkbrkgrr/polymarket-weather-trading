@@ -30,6 +30,7 @@ p_model_max: 0.12
 edge_threshold: 0.02
 max_no_price: 0.92
 max_spread: 0.05
+price_drift_tolerance: 0.01
 max_probability_age_days: 2
 max_snapshot_age_minutes: 30
 pause_on_stale_probabilities: true
@@ -39,17 +40,26 @@ top_n_per_event_day: 2
 
 stake_fraction: 0.005
 stake_cap_usd: 50
+drawdown_position_scaling: true
+max_drawdown_fraction: 0.2
+min_drawdown_scale: 0.25
 station_daily_risk_fraction: 0.02
 portfolio_daily_risk_fraction: 0.05
 stoploss_daily_pnl_fraction: 0.01
 stoploss_consecutive_days: 3
 max_open_positions_per_station: 4
 max_open_positions_total: 20
+trade_cooldown_minutes: 30
 
 slippage_buffer_yes_fallback: 0.01
 min_order_size: 1
 price_tick: 0.001
 use_limit_orders: true
+paper_execution_realism: true
+paper_execution_random_seed: 0
+paper_fill_probability_base: 0.9
+paper_partial_fill_probability: 0.2
+paper_max_slippage_ticks: 3
 
 run_interval_minutes: 0.1
 decision_cutoff_policy: latest_cycle_before_local_midnight

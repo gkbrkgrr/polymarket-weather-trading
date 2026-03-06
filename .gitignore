@@ -10,3 +10,4 @@ outputs/
 2022_gfs_backfill.log
 backfill_gfs.sh
 models/
+live_trading/state/*.lock

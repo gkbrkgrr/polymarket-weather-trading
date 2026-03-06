@@ -61,6 +61,7 @@ GENERIC_DIR_NAMES = {
     "output",
     "outputs",
 }
+ORDER_KEY_RETENTION_HOURS = 24.0
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "mode": "paper",
@@ -77,6 +78,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "edge_threshold": 0.02,
     "max_no_price": 0.92,
     "max_spread": 0.05,
+    "price_drift_tolerance": 0.01,
     "max_probability_age_days": 2,
     "max_snapshot_age_minutes": 30,
     "pause_on_stale_probabilities": True,
@@ -85,16 +87,25 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "top_n_per_event_day": 2,
     "stake_fraction": 0.005,
     "stake_cap_usd": 50,
+    "drawdown_position_scaling": True,
+    "max_drawdown_fraction": 0.2,
+    "min_drawdown_scale": 0.25,
     "station_daily_risk_fraction": 0.02,
     "portfolio_daily_risk_fraction": 0.05,
     "stoploss_daily_pnl_fraction": 0.01,
     "stoploss_consecutive_days": 3,
     "max_open_positions_per_station": 4,
     "max_open_positions_total": 20,
+    "trade_cooldown_minutes": 30,
     "slippage_buffer_yes_fallback": 0.01,
     "min_order_size": 1,
     "price_tick": 0.001,
     "use_limit_orders": True,
+    "paper_execution_realism": True,
+    "paper_execution_random_seed": 0,
+    "paper_fill_probability_base": 0.9,
+    "paper_partial_fill_probability": 0.2,
+    "paper_max_slippage_ticks": 3,
     "run_interval_minutes": 10,
     "decision_cutoff_policy": "latest_cycle_before_local_midnight",
     "lookahead_days": 4,
@@ -436,6 +447,35 @@ def _to_day_iso(value: Any) -> str | None:
     if pd.isna(ts):
         return None
     return ts.date().isoformat()
+
+
+def _build_order_key(payload: Mapping[str, Any]) -> str | None:
+    station_key = normalize_station_key(str(payload.get("station") or ""))
+    market_day_local = _to_day_iso(payload.get("market_day_local"))
+    try:
+        strike_k = int(payload.get("strike_k"))
+    except Exception:
+        strike_k = None
+    try:
+        chosen_no_ask = float(payload.get("chosen_no_ask"))
+    except Exception:
+        chosen_no_ask = None
+
+    side = str(payload.get("order_side") or "buy").strip().lower()
+    outcome = str(payload.get("order_outcome") or "NO").strip().upper()
+
+    if not station_key or market_day_local is None or strike_k is None or chosen_no_ask is None:
+        return None
+    return "|".join(
+        [
+            station_key,
+            market_day_local,
+            str(strike_k),
+            f"{chosen_no_ask:.6f}",
+            side,
+            outcome,
+        ]
+    )
 
 
 def resolve_open_market_universe(
@@ -879,11 +919,11 @@ def _update_stoploss_and_kills(
             state_store.set_global_kill(True)
             logger.warning("Global kill activated due to stoploss streak=%d", streak)
 
-    portfolio_risk = state_store.portfolio_risk_used(day_local=day_key)
+    portfolio_risk = state_store.portfolio_conservative_risk_used(day_local=day_key)
     portfolio_limit = float(state_store.nav_usd) * float(cfg.get("portfolio_daily_risk_fraction", 0.05))
     if portfolio_risk >= portfolio_limit:
         state_store.set_global_kill(True)
-        logger.warning("Global kill activated due to portfolio daily risk limit")
+        logger.warning("Global kill activated due to portfolio daily risk limit (conservative view)")
 
 
 def _settle_resolved_positions(
@@ -1079,8 +1119,12 @@ def _build_health_gate_blocked_policy(
     out["size"] = 0.0
     out["stake_usd"] = 0.0
     out["risk_used_station_today"] = 0.0
+    out["risk_used_station_daily"] = 0.0
+    out["risk_used_station_open"] = 0.0
     out["risk_limit_station_today"] = float(station_risk_limit)
     out["risk_used_portfolio_today"] = 0.0
+    out["risk_used_portfolio_daily"] = 0.0
+    out["risk_used_portfolio_open"] = 0.0
     out["risk_limit_portfolio_today"] = float(portfolio_risk_limit)
     return out
 
@@ -1292,6 +1336,7 @@ def run_cycle(
     else:
         policy_ctx = PolicyContext(
             nav_usd=float(state_store.nav_usd),
+            nav_peak_usd=float(state_store.nav_peak_usd),
             mode_distance_min=int(cfg.get("mode_distance_min", 2)),
             p_model_max=float(cfg.get("p_model_max", 0.12)),
             edge_threshold=float(cfg.get("edge_threshold", 0.02)),
@@ -1304,6 +1349,10 @@ def run_cycle(
             portfolio_daily_risk_fraction=float(cfg.get("portfolio_daily_risk_fraction", 0.05)),
             max_open_positions_per_station=int(cfg.get("max_open_positions_per_station", 4)),
             max_open_positions_total=int(cfg.get("max_open_positions_total", 20)),
+            trade_cooldown_minutes=float(cfg.get("trade_cooldown_minutes", 30)),
+            drawdown_position_scaling=bool(cfg.get("drawdown_position_scaling", True)),
+            max_drawdown_fraction=float(cfg.get("max_drawdown_fraction", 0.2)),
+            min_drawdown_scale=float(cfg.get("min_drawdown_scale", 0.25)),
             trade_window_start_local=str(cfg.get("trade_window", {}).get("start_local", "00:00")),
             trade_window_end_local=str(cfg.get("trade_window", {}).get("end_local", "12:00")),
         )
@@ -1318,72 +1367,302 @@ def run_cycle(
 
     mode = str(cfg.get("mode", "paper")).lower()
     if mode == "paper":
-        exec_client: Any = DummyExecutionClient(price_tick=float(cfg.get("price_tick", 0.001)), conservative_fill=True)
+        exec_client: Any = DummyExecutionClient(
+            price_tick=float(cfg.get("price_tick", 0.001)),
+            conservative_fill=True,
+            realism_enabled=bool(cfg.get("paper_execution_realism", True)),
+            deterministic_seed=int(cfg.get("paper_execution_random_seed", 0)),
+            fill_probability_base=float(cfg.get("paper_fill_probability_base", 0.9)),
+            partial_fill_probability=float(cfg.get("paper_partial_fill_probability", 0.2)),
+            max_slippage_ticks=int(cfg.get("paper_max_slippage_ticks", 3)),
+        )
     elif mode == "live":
         exec_client = RealExecutionClient()
     else:
         raise SystemExit(f"Invalid mode: {mode}")
 
     csv_trades_rows: list[dict[str, Any]] = []
+    trade_cooldown_minutes = max(0.0, float(cfg.get("trade_cooldown_minutes", 30)))
+    state_store.prune_recent_order_keys(retention_hours=ORDER_KEY_RETENTION_HOURS, now_utc=now)
+    state_store.prune_trade_cooldowns(cooldown_minutes=trade_cooldown_minutes, now_utc=now)
+    cycle_reserved_order_keys: set[str] = state_store.recent_order_key_set(
+        retention_hours=ORDER_KEY_RETENTION_HOURS,
+        now_utc=now,
+    )
+    cycle_reserved_position_identity_keys: set[str] = state_store.open_position_identity_keys()
+    cycle_reserved_cooldown_identity_keys: set[str] = state_store.active_trade_cooldown_keys(
+        cooldown_minutes=trade_cooldown_minutes,
+        now_utc=now,
+    )
 
     for row in policy_out.itertuples(index=False):
         payload = row._asdict()
         payload.setdefault("decision", "SKIP")
         payload.setdefault("skipped_reason", "")
         payload["ts_utc"] = now.isoformat()
+        payload["duplicate_guard_triggered"] = False
+        payload["idempotency_guard_triggered"] = False
+        payload["cooldown_guard_triggered"] = False
+        payload["chosen_no_ask_original"] = payload.get("chosen_no_ask")
+        payload["chosen_no_ask_refreshed"] = None
+        payload["edge_before_price_check"] = payload.get("edge")
+        payload["edge_after_price_check"] = payload.get("edge")
+        payload["price_check_skip_reason"] = None
+        payload["price_drift"] = None
+
+        day_key = str(payload.get("market_day_local"))
+        station = str(payload.get("station"))
+        payload["station_risk_before_trade"] = state_store.station_conservative_risk_used(day_local=day_key, station=station)
+        payload["portfolio_risk_before_trade"] = state_store.portfolio_conservative_risk_used(day_local=day_key)
+        payload["station_risk_after_trade"] = payload["station_risk_before_trade"]
+        payload["portfolio_risk_after_trade"] = payload["portfolio_risk_before_trade"]
 
         if payload["decision"] == "TRADE":
+            position_identity_key = state_store.position_identity_key(
+                station=payload.get("station"),
+                market_day_local=payload.get("market_day_local"),
+                strike_k=payload.get("strike_k"),
+            )
+            payload["position_identity_key"] = position_identity_key
+            payload["order_side"] = "buy"
+            payload["order_outcome"] = "NO"
+            payload["order_key"] = None
             if dry_run:
                 payload["order_status"] = "dry_run_would_trade"
                 payload["order_id"] = None
             else:
+                market_id = str(payload.get("market_id") or "").strip()
                 try:
-                    order_id = exec_client.place_order(
-                        market_id=str(payload["market_id"]),
-                        side="buy",
-                        outcome="NO",
-                        price=float(payload["chosen_no_ask"]),
-                        size=float(payload["size"]),
+                    original_price = float(payload.get("chosen_no_ask"))
+                except (TypeError, ValueError):
+                    original_price = None
+                try:
+                    no_true = 1.0 - float(payload.get("p_model"))
+                except (TypeError, ValueError):
+                    no_true = None
+
+                if position_identity_key and (
+                    position_identity_key in cycle_reserved_position_identity_keys
+                    or state_store.has_open_position_identity(
+                        station=payload.get("station"),
+                        market_day_local=payload.get("market_day_local"),
+                        strike_k=payload.get("strike_k"),
                     )
-                    payload["order_id"] = order_id
-                    payload["order_status"] = "submitted"
-
-                    if hasattr(exec_client, "execution_result"):
-                        res = exec_client.execution_result(order_id)
-                        if res is not None:
-                            payload["order_status"] = res.order_status
-                            if res.filled_price is not None:
-                                payload["chosen_no_ask"] = float(res.filled_price)
-                                payload["stake_usd"] = float(payload["chosen_no_ask"]) * float(payload["size"])
-
-                    day_key = str(payload["market_day_local"])
-                    station = str(payload["station"])
-                    state_store.add_trade(day_local=day_key, station=station, risk_used=float(payload.get("stake_usd") or 0.0))
-
-                    pos_id = state_store.add_open_position(
-                        {
-                            "station": station,
-                            "market_day_local": day_key,
-                            "market_id": payload.get("market_id"),
-                            "slug": payload.get("slug"),
-                            "asset_id": payload.get("asset_id"),
-                            "strike_k": payload.get("strike_k"),
-                            "mode_k": payload.get("mode_k"),
-                            "p_model": payload.get("p_model"),
-                            "entry_price": payload.get("chosen_no_ask"),
-                            "size": payload.get("size"),
-                            "stake_usd": payload.get("stake_usd"),
-                            "edge_at_entry": payload.get("edge"),
-                            "price_source": payload.get("price_source"),
-                        }
-                    )
-                    payload["position_id"] = pos_id
-                except Exception as exc:
+                ):
+                    cycle_reserved_position_identity_keys.add(position_identity_key)
                     payload["decision"] = "SKIP"
-                    payload["skipped_reason"] = "kill_switch_active" if state_store.is_global_kill() else "risk_limit_hit"
-                    payload["order_status"] = "error"
-                    payload["error"] = f"{exc.__class__.__name__}: {exc}"
-                    logger.exception("Order placement failed")
+                    payload["skipped_reason"] = "already_open_position"
+                    payload["order_status"] = "skipped_already_open_position"
+                    payload["error"] = f"duplicate_position_identity: {position_identity_key}"
+                    payload["duplicate_guard_triggered"] = True
+                elif position_identity_key and (
+                    position_identity_key in cycle_reserved_cooldown_identity_keys
+                    or state_store.is_trade_cooldown_active(
+                        position_identity_key,
+                        cooldown_minutes=trade_cooldown_minutes,
+                        now_utc=now,
+                    )
+                ):
+                    cycle_reserved_cooldown_identity_keys.add(position_identity_key)
+                    payload["decision"] = "SKIP"
+                    payload["skipped_reason"] = "trade_cooldown"
+                    payload["order_status"] = "skipped_trade_cooldown"
+                    payload["error"] = f"trade_cooldown_active: {position_identity_key}"
+                    payload["cooldown_guard_triggered"] = True
+                elif not market_id or original_price is None:
+                    payload["decision"] = "SKIP"
+                    payload["skipped_reason"] = "price_check_failed"
+                    payload["order_status"] = "skipped_price_check_failed"
+                    payload["error"] = "pre_order_price_check_failed: missing_market_or_price"
+                else:
+                    try:
+                        refreshed_snapshot_df = dbmod.fetch_latest_snapshots(
+                            conn,
+                            snapshot_table=snapshot_info,
+                            market_ids=[market_id],
+                        )
+                        refreshed_snapshot = None
+                        if not refreshed_snapshot_df.empty:
+                            refreshed_row = refreshed_snapshot_df.iloc[0]
+                            refreshed_snapshot = {
+                                "yes_snapshot_ts_utc": refreshed_row.get("yes_snapshot_ts_utc"),
+                                "no_snapshot_ts_utc": refreshed_row.get("no_snapshot_ts_utc"),
+                                "best_yes_bid": refreshed_row.get("best_yes_bid"),
+                                "best_yes_ask": refreshed_row.get("best_yes_ask"),
+                                "best_no_bid": refreshed_row.get("best_no_bid"),
+                                "best_no_ask": refreshed_row.get("best_no_ask"),
+                                "yes_bid_size": refreshed_row.get("yes_bid_size"),
+                                "yes_ask_size": refreshed_row.get("yes_ask_size"),
+                                "no_bid_size": refreshed_row.get("no_bid_size"),
+                                "no_ask_size": refreshed_row.get("no_ask_size"),
+                            }
+
+                        refreshed_pricing = compute_pricing_decision(
+                            snapshot=refreshed_snapshot,
+                            now_utc=utc_now(),
+                            max_snapshot_age_minutes=float(cfg.get("max_snapshot_age_minutes", 30)),
+                            slippage_buffer_yes_fallback=float(cfg.get("slippage_buffer_yes_fallback", 0.01)),
+                            max_spread=float(cfg.get("max_spread", 0.05)),
+                        )
+                    except Exception as exc:
+                        payload["decision"] = "SKIP"
+                        payload["skipped_reason"] = "price_check_failed"
+                        payload["order_status"] = "skipped_price_check_failed"
+                        payload["error"] = f"pre_order_price_check_failed: {exc.__class__.__name__}: {exc}"
+                    else:
+                        payload["chosen_no_ask_refreshed"] = refreshed_pricing.chosen_no_ask
+                        payload["price_check_skip_reason"] = refreshed_pricing.skipped_reason
+
+                        if refreshed_pricing.skipped_reason is not None or refreshed_pricing.chosen_no_ask is None:
+                            payload["decision"] = "SKIP"
+                            payload["skipped_reason"] = "price_check_failed"
+                            payload["order_status"] = "skipped_price_check_failed"
+                            payload["error"] = (
+                                "pre_order_price_check_failed: "
+                                f"{refreshed_pricing.skipped_reason or 'no_snapshot'}"
+                            )
+                        else:
+                            refreshed_price = float(refreshed_pricing.chosen_no_ask)
+                            price_drift = refreshed_price - original_price
+                            payload["price_drift"] = float(price_drift)
+                            if no_true is not None:
+                                payload["edge_after_price_check"] = float(no_true - refreshed_price)
+                            if price_drift > float(cfg.get("price_drift_tolerance", 0.01)):
+                                payload["decision"] = "SKIP"
+                                payload["skipped_reason"] = "price_drift"
+                                payload["order_status"] = "skipped_price_drift"
+                                payload["error"] = (
+                                    "pre_order_price_drift: "
+                                    f"original={original_price:.6f} refreshed={refreshed_price:.6f} drift={price_drift:.6f}"
+                                )
+                            else:
+                                payload["chosen_no_ask"] = refreshed_price
+                                payload["price_source"] = refreshed_pricing.price_source
+                                payload["snapshot_ts_utc"] = (
+                                    refreshed_pricing.snapshot_ts_utc.isoformat()
+                                    if refreshed_pricing.snapshot_ts_utc is not None
+                                    else None
+                                )
+                                payload["snapshot_age_minutes"] = refreshed_pricing.snapshot_age_minutes
+                                payload["spread"] = refreshed_pricing.spread
+                                payload["snapshot_skip_reason"] = refreshed_pricing.skipped_reason
+                                payload["stake_usd"] = float(refreshed_price) * float(payload["size"])
+
+                if payload["decision"] == "TRADE":
+                    order_key = _build_order_key(payload)
+                    payload["order_key"] = order_key
+
+                    if order_key is None:
+                        payload["decision"] = "SKIP"
+                        payload["skipped_reason"] = "order_key_failed"
+                        payload["order_status"] = "skipped_order_key_failed"
+                        payload["error"] = "order_key_failed: missing_required_fields"
+                    elif order_key in cycle_reserved_order_keys or state_store.has_recent_order_key(
+                        order_key,
+                        retention_hours=ORDER_KEY_RETENTION_HOURS,
+                        now_utc=now,
+                    ):
+                        cycle_reserved_order_keys.add(order_key)
+                        payload["decision"] = "SKIP"
+                        payload["skipped_reason"] = "duplicate_order_key"
+                        payload["order_status"] = "skipped_duplicate_order_key"
+                        payload["error"] = f"duplicate_order_key: {order_key}"
+                        payload["idempotency_guard_triggered"] = True
+                    else:
+                        try:
+                            state_store.record_recent_order_key(
+                                order_key,
+                                retention_hours=ORDER_KEY_RETENTION_HOURS,
+                                now_utc=utc_now(),
+                            )
+                            cycle_reserved_order_keys.add(order_key)
+                            # Persist reservation before placement to prevent restart duplicates.
+                            state_store.persist()
+                        except Exception as exc:
+                            payload["decision"] = "SKIP"
+                            payload["skipped_reason"] = "order_key_failed"
+                            payload["order_status"] = "skipped_order_key_failed"
+                            payload["error"] = f"order_key_record_failed: {exc.__class__.__name__}: {exc}"
+
+                if payload["decision"] == "TRADE":
+                    if position_identity_key:
+                        cycle_reserved_position_identity_keys.add(position_identity_key)
+                    try:
+                        order_id = exec_client.place_order(
+                            market_id=str(payload["market_id"]),
+                            side="buy",
+                            outcome="NO",
+                            price=float(payload["chosen_no_ask"]),
+                            size=float(payload["size"]),
+                            metadata={
+                                "spread": payload.get("spread"),
+                                "snapshot_age_minutes": payload.get("snapshot_age_minutes"),
+                                "price_source": payload.get("price_source"),
+                            },
+                        )
+                        payload["order_id"] = order_id
+                        payload["order_status"] = "submitted"
+                        filled_size = float(payload.get("size") or 0.0)
+
+                        if hasattr(exec_client, "execution_result"):
+                            res = exec_client.execution_result(order_id)
+                            if res is not None:
+                                payload["order_status"] = res.order_status
+                                if res.filled_size is not None:
+                                    filled_size = max(0.0, float(res.filled_size))
+                                if res.filled_price is not None:
+                                    payload["chosen_no_ask"] = float(res.filled_price)
+                        payload["filled_size"] = filled_size
+
+                        if filled_size <= 0:
+                            payload["decision"] = "SKIP"
+                            payload["skipped_reason"] = "not_filled"
+                            payload["error"] = "order_not_filled"
+                        else:
+                            payload["size"] = filled_size
+                            payload["stake_usd"] = float(payload["chosen_no_ask"]) * float(filled_size)
+                            state_store.add_trade(day_local=day_key, station=station, risk_used=float(payload.get("stake_usd") or 0.0))
+
+                            pos_id = state_store.add_open_position(
+                                {
+                                    "station": station,
+                                    "market_day_local": day_key,
+                                    "market_id": payload.get("market_id"),
+                                    "slug": payload.get("slug"),
+                                    "asset_id": payload.get("asset_id"),
+                                    "strike_k": payload.get("strike_k"),
+                                    "mode_k": payload.get("mode_k"),
+                                    "p_model": payload.get("p_model"),
+                                    "entry_price": payload.get("chosen_no_ask"),
+                                    "size": payload.get("size"),
+                                    "stake_usd": payload.get("stake_usd"),
+                                    "edge_at_entry": payload.get("edge_after_price_check"),
+                                    "price_source": payload.get("price_source"),
+                                    "order_key": payload.get("order_key"),
+                                }
+                            )
+                            payload["position_id"] = pos_id
+                            if position_identity_key:
+                                state_store.record_trade_cooldown(
+                                    position_identity_key,
+                                    cooldown_minutes=trade_cooldown_minutes,
+                                    now_utc=utc_now(),
+                                )
+                                cycle_reserved_cooldown_identity_keys.add(position_identity_key)
+
+                            payload["station_risk_after_trade"] = state_store.station_conservative_risk_used(
+                                day_local=day_key,
+                                station=station,
+                            )
+                            payload["portfolio_risk_after_trade"] = state_store.portfolio_conservative_risk_used(
+                                day_local=day_key
+                            )
+                    except Exception as exc:
+                        payload["decision"] = "SKIP"
+                        payload["skipped_reason"] = "kill_switch_active" if state_store.is_global_kill() else "risk_limit_hit"
+                        payload["order_status"] = "error"
+                        payload["error"] = f"{exc.__class__.__name__}: {exc}"
+                        logger.exception("Order placement failed")
         else:
             state_store.add_skip(day_local=str(payload["market_day_local"]), station=str(payload["station"]))
 
@@ -1462,7 +1741,11 @@ def main(argv: list[str] | None = None) -> int:
 
     logger.info("Starting live pilot run_id=%s mode=%s dry_run=%s", run_id, cfg.get("mode"), args.dry_run)
 
-    state_store = PilotStateStore(output_dir / "state", nav_usd=float(cfg.get("nav_usd", 10000)))
+    try:
+        state_store = PilotStateStore(output_dir / "state", nav_usd=float(cfg.get("nav_usd", 10000)))
+    except Exception as exc:
+        logger.error("State store setup failure: %s", exc)
+        return 1
     notifier = TelegramNotifier.from_config(
         cfg=cfg,
         repo_root=REPO_ROOT,
@@ -1555,6 +1838,10 @@ def main(argv: list[str] | None = None) -> int:
                 conn.close()
             except Exception:
                 pass
+        try:
+            state_store.close()
+        except Exception:
+            pass
 
     return 0
 
