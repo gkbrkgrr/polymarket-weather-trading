@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Trading Panel</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='panel.css') }}" />
+  <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+</head>
+<body>
+  <div class="page-shell">
+    <header class="panel-header">
+      <div class="panel-title-wrap">
+        <h1 id="panel-date-title">{{ default_date }}</h1>
+      </div>
+      <div class="panel-controls">
+        <label for="date-input">Date</label>
+        <input id="date-input" type="date" value="{{ default_date }}" />
+        <button id="reload-btn" type="button">Reload</button>
+        <span id="status-pill"></span>
+      </div>
+    </header>
+
+    <main>
+      <section id="stations-grid" aria-live="polite"></section>
+    </main>
+  </div>
+
+  <script>
+    window.TRADING_PANEL_BOOTSTRAP = {
+      defaultDate: "{{ default_date }}",
+      panelDataUrl: "{{ url_for('panel_data') }}"
+    };
+  </script>
+  <script src="{{ url_for('static', filename='panel.js') }}"></script>
+</body>
+</html>
