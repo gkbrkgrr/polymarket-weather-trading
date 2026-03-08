@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import threading
 
 from flask import Flask, abort, jsonify, render_template, request
 
@@ -8,6 +9,7 @@ from .config import (
     CACHE_TTL_SECONDS,
     DEFAULT_HISTORY_DAYS,
     DEFAULT_HOST,
+    DEFAULT_PARQUET_READ_WORKERS,
     DEFAULT_PORT,
     LOCATIONS_CSV,
     MODEL_SPECS,
@@ -23,7 +25,20 @@ service = PanelDataService(
     master_dsn=resolve_panel_master_dsn(),
     cache_ttl_seconds=CACHE_TTL_SECONDS,
     default_history_days=DEFAULT_HISTORY_DAYS,
+    parquet_read_workers=DEFAULT_PARQUET_READ_WORKERS,
 )
+
+
+def _warm_today_cache() -> None:
+    today = dt.date.today()
+    try:
+        service.warm_cache_for_day(today)
+        app.logger.info("Warm-cache ready for %s", today.isoformat())
+    except Exception:
+        app.logger.exception("Warm-cache failed for %s", today.isoformat())
+
+
+threading.Thread(target=_warm_today_cache, name="trading-panel-warm-cache", daemon=True).start()
 
 
 @app.get("/")

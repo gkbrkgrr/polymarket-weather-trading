@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import datetime as dt
 import json
 import re
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -17,7 +19,7 @@ from master_db import get_historical_daily_tmax_bounds as fetch_historical_daily
 
 from .config import ModelSpec
 
-REQUIRED_PRED_COLUMNS = ["city_name", "issue_time_utc", "target_date_local", "Forecast"]
+REQUIRED_PRED_COLUMNS = ["issue_time_utc", "target_date_local", "Forecast"]
 CYCLE_TOKEN_PATTERN = re.compile(r"(\d{10})$")
 TITLE_BETWEEN_PATTERN = re.compile(r"be between\s+(-?\d+)\s*-\s*(-?\d+)\s*°([CF])", re.IGNORECASE)
 TITLE_EXACT_PATTERN = re.compile(r"be\s+(-?\d+)\s*°([CF])\s+on", re.IGNORECASE)
@@ -55,11 +57,13 @@ class PanelDataService:
         master_dsn: str,
         cache_ttl_seconds: int,
         default_history_days: int,
+        parquet_read_workers: int,
     ) -> None:
         self.model_specs = model_specs
         self.locations_csv = locations_csv
         self.master_dsn = master_dsn
         self.cache_ttl_seconds = max(1, int(cache_ttl_seconds))
+        self.parquet_read_workers = max(1, int(parquet_read_workers))
 
         self.station_meta = self._load_station_meta(locations_csv)
         self.file_index = self._build_file_index(model_specs)
@@ -68,32 +72,55 @@ class PanelDataService:
         self.historical_bounds = self._load_historical_bounds()
         self.resolved_yes_markets = self._load_resolved_yes_markets()
 
+        self._cache_lock = threading.Lock()
         self._cache: dict[str, tuple[float, dict[str, Any]]] = {}
 
-    def get_panel_payload(self, day: dt.date) -> dict[str, Any]:
+    def get_panel_payload(self, day: dt.date, *, force_refresh: bool = False) -> dict[str, Any]:
         cache_key = day.isoformat()
         now = time.monotonic()
-        cached = self._cache.get(cache_key)
-        if cached is not None:
-            loaded_at, payload = cached
-            if now - loaded_at <= self.cache_ttl_seconds:
-                return payload
+        if not force_refresh:
+            with self._cache_lock:
+                cached = self._cache.get(cache_key)
+            if cached is not None:
+                loaded_at, payload = cached
+                if now - loaded_at <= self.cache_ttl_seconds:
+                    return payload
 
         payload = self._build_payload(day)
-        self._cache[cache_key] = (now, payload)
+        with self._cache_lock:
+            self._cache[cache_key] = (time.monotonic(), payload)
         return payload
 
+    def warm_cache_for_day(self, day: dt.date) -> None:
+        self.get_panel_payload(day, force_refresh=True)
+
     def _build_payload(self, day: dt.date) -> dict[str, Any]:
+        payload_started = time.perf_counter()
+        db_observations_ms = 0.0
+
         now_utc = dt.datetime.now(dt.timezone.utc)
+        db_started = time.perf_counter()
         last_max_obs = self._fetch_last_max_observations(day)
+        db_observations_ms += (time.perf_counter() - db_started) * 1000.0
         month_day = day.strftime("%m-%d")
 
-        stations_payload: list[dict[str, Any]] = []
+        station_meta_lookup: dict[str, StationMeta] = {}
         for station in self.stations:
-            meta = self.station_meta.get(
+            station_meta_lookup[station] = self.station_meta.get(
                 station,
                 StationMeta(timezone="UTC", is_usa=False, resolution_source_key=""),
             )
+
+        parquet_started = time.perf_counter()
+        station_model_frames, parquet_task_sum_ms = self._load_station_model_days_parallel(
+            day=day,
+            station_meta_lookup=station_meta_lookup,
+        )
+        parquet_reads_ms = (time.perf_counter() - parquet_started) * 1000.0
+
+        stations_payload: list[dict[str, Any]] = []
+        for station in self.stations:
+            meta = station_meta_lookup[station]
             unit = "F" if meta.is_usa else "C"
             last_max_snapshot = last_max_obs.get(station)
             current_local_time = self._format_current_local_time(day, meta, now_utc)
@@ -107,7 +134,10 @@ class PanelDataService:
 
             traces: list[dict[str, Any]] = []
             for spec in self.model_specs:
-                model_df = self._load_station_model_day(station=station, day=day, model_spec=spec, is_usa=meta.is_usa)
+                model_df = station_model_frames.get(
+                    (station, spec.key),
+                    pd.DataFrame(columns=["issue_time_utc", "forecast_rounded"]),
+                )
                 traces.append(
                     {
                         "model_key": spec.key,
@@ -139,13 +169,65 @@ class PanelDataService:
                 }
             )
 
+        payload_build_ms = (time.perf_counter() - payload_started) * 1000.0
         return {
             "date": day.isoformat(),
             "generated_at_utc": now_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
             "history_days": self.history_days,
             "station_count": len(stations_payload),
+            "timings_ms": {
+                "db_observations": round(db_observations_ms, 2),
+                "parquet_reads": round(parquet_reads_ms, 2),
+                "parquet_reads_task_sum": round(parquet_task_sum_ms, 2),
+                "payload_build": round(payload_build_ms, 2),
+            },
             "stations": stations_payload,
         }
+
+    def _load_station_model_days_parallel(
+        self,
+        *,
+        day: dt.date,
+        station_meta_lookup: dict[str, StationMeta],
+    ) -> tuple[dict[tuple[str, str], pd.DataFrame], float]:
+        tasks: list[tuple[str, ModelSpec, bool]] = []
+        for station in self.stations:
+            meta = station_meta_lookup[station]
+            for spec in self.model_specs:
+                tasks.append((station, spec, meta.is_usa))
+
+        out: dict[tuple[str, str], pd.DataFrame] = {}
+        parquet_task_sum_ms = 0.0
+        if not tasks:
+            return out, parquet_task_sum_ms
+
+        def _worker(station: str, model_spec: ModelSpec, is_usa: bool) -> tuple[str, str, pd.DataFrame, float]:
+            started = time.perf_counter()
+            df = self._load_station_model_day(
+                station=station,
+                day=day,
+                model_spec=model_spec,
+                is_usa=is_usa,
+            )
+            elapsed_ms = (time.perf_counter() - started) * 1000.0
+            return station, model_spec.key, df, elapsed_ms
+
+        max_workers = min(self.parquet_read_workers, len(tasks))
+        if max_workers <= 1:
+            for station, spec, is_usa in tasks:
+                st, model_key, frame, elapsed_ms = _worker(station, spec, is_usa)
+                out[(st, model_key)] = frame
+                parquet_task_sum_ms += elapsed_ms
+            return out, parquet_task_sum_ms
+
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = [pool.submit(_worker, station, spec, is_usa) for station, spec, is_usa in tasks]
+            for future in as_completed(futures):
+                station, model_key, frame, elapsed_ms = future.result()
+                out[(station, model_key)] = frame
+                parquet_task_sum_ms += elapsed_ms
+
+        return out, parquet_task_sum_ms
 
     def _load_station_model_day(
         self,
@@ -161,17 +243,19 @@ class PanelDataService:
 
         parts: list[pd.DataFrame] = []
         for file_path in files:
-            part = pd.read_parquet(file_path, columns=REQUIRED_PRED_COLUMNS)
+            try:
+                part = pd.read_parquet(
+                    file_path,
+                    columns=REQUIRED_PRED_COLUMNS,
+                    filters=[("target_date_local", "==", day)],
+                )
+            except (TypeError, ValueError, NotImplementedError):
+                part = pd.read_parquet(file_path, columns=REQUIRED_PRED_COLUMNS)
             if part.empty:
                 continue
 
             part["target_date_local"] = pd.to_datetime(part["target_date_local"], errors="coerce").dt.date
             part = part[part["target_date_local"] == day]
-            if part.empty:
-                continue
-
-            part["city_name"] = part["city_name"].astype(str)
-            part = part[part["city_name"] == station]
             if part.empty:
                 continue
 
@@ -210,18 +294,22 @@ class PanelDataService:
         return selected
 
     def _fetch_last_max_observations(self, day: dt.date) -> dict[str, ObservationSnapshot]:
+        day_start = dt.datetime.combine(day, dt.time.min)
+        day_end = day_start + dt.timedelta(days=1)
         query = (
             "SELECT "
             "station, observed_at_local, temperature_f, temperature_c "
             "FROM station_observations "
-            "WHERE station = ANY(%s) AND observed_at_local::date = %s "
+            "WHERE station = ANY(%s) "
+            "AND observed_at_local >= %s "
+            "AND observed_at_local < %s "
             "ORDER BY station, observed_at_local"
         )
 
         best_by_station: dict[str, tuple[float, dt.datetime]] = {}
         with psycopg.connect(self.master_dsn) as conn:
             with conn.cursor() as cur:
-                cur.execute(query, (self.stations, day))
+                cur.execute(query, (self.stations, day_start, day_end))
                 rows = cur.fetchall()
 
         for station, observed_at_local, temperature_f, temperature_c in rows:

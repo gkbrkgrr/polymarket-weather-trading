@@ -17,6 +17,7 @@ async function loadPanel(dateValue) {
     return;
   }
   loading = true;
+  const requestStarted = performance.now();
   setStatus("Loading...");
 
   try {
@@ -32,8 +33,17 @@ async function loadPanel(dateValue) {
     }
 
     const payload = await response.json();
+    const renderStarted = performance.now();
     renderPanel(payload);
+    const renderMs = performance.now() - renderStarted;
+    const totalMs = performance.now() - requestStarted;
+    const serverTimings = payload.timings_ms || {};
     setStatus(`Updated ${new Date().toLocaleTimeString()}`);
+    console.log("trading_panel_timings", {
+      server: serverTimings,
+      client_render_ms: Number(renderMs.toFixed(2)),
+      request_total_ms: Number(totalMs.toFixed(2)),
+    });
   } catch (error) {
     stationsGrid.innerHTML = `<div class="station-card"><div class="empty-plot">${escapeHtml(String(error))}</div></div>`;
     setStatus("Load failed");

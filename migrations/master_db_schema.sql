@@ -17,6 +17,9 @@ CREATE INDEX IF NOT EXISTS station_observations_station_idx
 CREATE INDEX IF NOT EXISTS station_observations_observed_at_local_idx
     ON station_observations(observed_at_local);
 
+CREATE INDEX IF NOT EXISTS station_observations_station_observed_at_local_idx
+    ON station_observations(station, observed_at_local);
+
 CREATE TABLE IF NOT EXISTS markets (
     market_id TEXT PRIMARY KEY,
     slug TEXT NULL,

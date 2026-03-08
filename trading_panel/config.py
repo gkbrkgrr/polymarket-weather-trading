@@ -60,6 +60,10 @@ MODEL_SPECS = build_model_specs()
 LOCATIONS_CSV = _resolve_path("TRADING_PANEL_LOCATIONS_CSV", DEFAULT_LOCATIONS_CSV)
 CACHE_TTL_SECONDS = int(os.getenv("TRADING_PANEL_CACHE_TTL_SECONDS", "120"))
 DEFAULT_HISTORY_DAYS = int(os.getenv("TRADING_PANEL_HISTORY_DAYS", "16"))
+_default_workers = max(4, min(12, os.cpu_count() or 8))
+DEFAULT_PARQUET_READ_WORKERS = int(
+    os.getenv("TRADING_PANEL_PARQUET_READ_WORKERS", str(_default_workers))
+)
 DEFAULT_HOST = os.getenv("TRADING_PANEL_HOST", "127.0.0.1")
 DEFAULT_PORT = int(os.getenv("TRADING_PANEL_PORT", "8787"))
 
