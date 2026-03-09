@@ -15,6 +15,19 @@ STATE_FILE_NAME = "live_state.json"
 STATE_LOCK_FILE_NAME = "live_state.lock"
 
 
+def build_logical_market_key(*, station: Any, market_day_local: Any, strike_k: Any) -> str | None:
+    station_key = normalize_station_key(str(station or ""))
+    day_local = parse_local_day(market_day_local)
+    try:
+        strike = int(strike_k)
+    except Exception:
+        strike = None
+
+    if not station_key or day_local is None or strike is None:
+        return None
+    return f"{station_key}|{day_local.isoformat()}|{strike}"
+
+
 @dataclass
 class PositionRecord:
     position_id: str
@@ -95,6 +108,7 @@ class PilotStateStore:
             "open_positions": [],
             "recent_order_keys": [],
             "trade_cooldowns": {},
+            "forecast_progression": {},
             "last_report_date_local": None,
             "stoploss": {
                 "consecutive_days_hit": 0,
@@ -126,6 +140,9 @@ class PilotStateStore:
         loaded.setdefault("open_positions", [])
         loaded.setdefault("recent_order_keys", [])
         loaded.setdefault("trade_cooldowns", {})
+        loaded.setdefault("forecast_progression", {})
+        if not isinstance(loaded.get("forecast_progression"), dict):
+            loaded["forecast_progression"] = {}
         loaded.setdefault("last_report_date_local", None)
         loaded.setdefault("stoploss", {"consecutive_days_hit": 0, "history": []})
         return loaded
@@ -252,6 +269,13 @@ class PilotStateStore:
             self.state["trade_cooldowns"] = rows
         return rows
 
+    def forecast_progression(self) -> dict[str, list[dict[str, Any]]]:
+        rows = self.state.get("forecast_progression", {})
+        if not isinstance(rows, dict):
+            rows = {}
+            self.state["forecast_progression"] = rows
+        return rows
+
     def recent_order_keys(self) -> list[dict[str, Any]]:
         rows = self.state.get("recent_order_keys", [])
         if not isinstance(rows, list):
@@ -369,16 +393,11 @@ class PilotStateStore:
         self.trade_cooldowns()[key] = now_ref.isoformat()
 
     def position_identity_key(self, *, station: Any, market_day_local: Any, strike_k: Any) -> str | None:
-        station_key = normalize_station_key(str(station or ""))
-        day_local = parse_local_day(market_day_local)
-        try:
-            strike = int(strike_k)
-        except Exception:
-            strike = None
-
-        if not station_key or day_local is None or strike is None:
-            return None
-        return f"{station_key}|{day_local.isoformat()}|{strike}"
+        return build_logical_market_key(
+            station=station,
+            market_day_local=market_day_local,
+            strike_k=strike_k,
+        )
 
     def open_position_identity_keys(self) -> set[str]:
         keys: set[str] = set()

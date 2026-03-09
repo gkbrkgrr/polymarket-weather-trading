@@ -47,7 +47,7 @@ This directory contains a production-minded, minimal scaffold for running a NO-o
 1. **Cycle scheduling and orchestration (LT-07)**  
    `scripts/trigger_gfs_cycle_pipeline.py` runs on each publish window and calls `scripts/run_gfs_cycle_pipeline.py`.
 2. **Forecast + probability generation**  
-   The cycle pipeline runs raw extraction, station Tmax predictors, market probability generation, and forecast reporting; outputs are written under `reports/live_probabilities/cycles/<cycle>/...` and promoted via `latest_manifest.json`.
+   The cycle pipeline runs raw extraction, station Tmax predictors, market probability generation, progression-state update, and forecast reporting; outputs are written under `reports/live_probabilities/cycles/<cycle>/...` and promoted via `latest_manifest.json`.
 3. **Live pilot runtime (LT-08, LT-09)**  
    `live_trading/run_live_pilot.py` resolves the latest valid probabilities artifact, maps to open markets from `master_db`, applies freshness/health gates, selector policy, risk controls, and execution (paper/live mode abstraction).
 4. **Parity validation (LT-10)**  

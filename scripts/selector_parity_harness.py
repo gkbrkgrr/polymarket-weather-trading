@@ -104,6 +104,7 @@ def build_candidates(
 
     records: list[dict[str, Any]] = []
     for row in universe.itertuples(index=False):
+        row_dict = row._asdict()
         snapshot = None if pd.isna(row.market_id) else snapshot_map.get(str(row.market_id))
         pricing = compute_pricing_decision(
             snapshot=snapshot,
@@ -121,6 +122,12 @@ def build_candidates(
         if pd.isna(market_day):
             continue
         market_day_iso = market_day.date().isoformat()
+        p_model_raw_val = row_dict.get("p_model_raw")
+        if p_model_raw_val is None or pd.isna(p_model_raw_val):
+            p_model_raw_val = row.p_model
+        p_model_adjusted_val = row_dict.get("p_model_adjusted")
+        if p_model_adjusted_val is None or pd.isna(p_model_adjusted_val):
+            p_model_adjusted_val = row.p_model
 
         records.append(
             {
@@ -135,6 +142,8 @@ def build_candidates(
                 "strike_k": int(row.strike_k),
                 "mode_k": int(row.mode_k),
                 "p_model": float(row.p_model),
+                "p_model_raw": float(p_model_raw_val),
+                "p_model_adjusted": float(p_model_adjusted_val),
                 "chosen_no_ask": pricing.chosen_no_ask,
                 "snapshot_skip_reason": pricing.skipped_reason,
                 "snapshot_age_minutes": pricing.snapshot_age_minutes,
@@ -150,6 +159,36 @@ def build_candidates(
                 "yes_lookback": 24.0,
             }
         )
+        for key, value in row_dict.items():
+            if key.startswith("pred_"):
+                records[-1][key] = value
+        for key in (
+            "ensemble_pred_median",
+            "ensemble_pred_mean",
+            "ensemble_pred_min",
+            "ensemble_pred_max",
+            "ensemble_pred_range",
+            "ensemble_pred_std",
+            "ensemble_pred_iqr",
+            "ensemble_bullish_count",
+            "ensemble_bearish_count",
+            "ensemble_agreement_score",
+            "ensemble_disagreement_score",
+            "ensemble_sign_agreement_ratio",
+            "ensemble_cross_strike_disagreement",
+            "ensemble_models_yes_count",
+            "ensemble_models_no_count",
+            "ensemble_same_side_ratio",
+            "ensemble_strike_disagreement_flag",
+            "ensemble_confidence_multiplier",
+            "ensemble_uncertainty_penalty",
+            "ensemble_size_multiplier",
+            "ensemble_gate_pass",
+            "ensemble_gate_reason",
+            "ensemble_fallback_marker",
+        ):
+            if key in row_dict:
+                records[-1][key] = row_dict.get(key)
 
     return pd.DataFrame.from_records(records)
 
@@ -165,6 +204,7 @@ def run_live_selector(
         state = PilotStateStore(Path(td), nav_usd=1_000_000_000.0)
         ctx = PolicyContext(
             nav_usd=1_000_000_000.0,
+            nav_peak_usd=1_000_000_000.0,
             mode_distance_min=int(cfg.get("mode_distance_min", 2)),
             p_model_max=float(cfg.get("p_model_max", 0.12)),
             edge_threshold=float(cfg.get("edge_threshold", 0.02)),
@@ -177,8 +217,57 @@ def run_live_selector(
             portfolio_daily_risk_fraction=1.0,
             max_open_positions_per_station=1_000_000,
             max_open_positions_total=1_000_000,
+            trade_cooldown_minutes=0.0,
+            drawdown_position_scaling=False,
+            max_drawdown_fraction=0.2,
+            min_drawdown_scale=1.0,
             trade_window_start_local="00:00",
             trade_window_end_local="23:59",
+            use_progression_confidence=bool(cfg.get("use_progression_confidence", True)),
+            progression_enable_gate=bool(cfg.get("progression_enable_gate", True)),
+            progression_min_cycles_seen=int(cfg.get("progression_min_cycles_seen", 3)),
+            progression_min_consecutive_candidate_cycles=int(
+                cfg.get("progression_min_consecutive_candidate_cycles", 2)
+            ),
+            progression_enable_negative_veto=bool(cfg.get("progression_enable_negative_veto", True)),
+            progression_negative_edge_trend_threshold=float(
+                cfg.get("progression_negative_edge_trend_threshold", -0.01)
+            ),
+            progression_min_mode_consistency_ratio=float(cfg.get("progression_min_mode_consistency_ratio", 0.40)),
+            progression_negative_p_model_trend_threshold=float(
+                cfg.get("progression_negative_p_model_trend_threshold", 0.01)
+            ),
+            progression_weight_consecutive=float(cfg.get("progression_weight_consecutive", 0.30)),
+            progression_weight_candidate_ratio=float(cfg.get("progression_weight_candidate_ratio", 0.20)),
+            progression_weight_edge_trend=float(cfg.get("progression_weight_edge_trend", 0.20)),
+            progression_weight_mode_consistency=float(cfg.get("progression_weight_mode_consistency", 0.15)),
+            progression_weight_low_p_model=float(cfg.get("progression_weight_low_p_model", 0.10)),
+            progression_weight_low_edge_volatility=float(cfg.get("progression_weight_low_edge_volatility", 0.05)),
+            progression_edge_trend_cap=float(cfg.get("progression_edge_trend_cap", 0.05)),
+            progression_enable_size_multiplier=bool(cfg.get("progression_enable_size_multiplier", True)),
+            progression_min_size_multiplier=float(cfg.get("progression_min_size_multiplier", 0.85)),
+            progression_max_size_multiplier=float(cfg.get("progression_max_size_multiplier", 1.35)),
+            use_ensemble_confidence=bool(cfg.get("use_ensemble_confidence", True)),
+            ensemble_probability_adjustment_enabled=bool(
+                cfg.get("ensemble_probability_adjustment_enabled", True)
+            ),
+            ensemble_trade_size_adjustment_enabled=bool(
+                cfg.get("ensemble_trade_size_adjustment_enabled", True)
+            ),
+            ensemble_disagreement_neutral_shrink_cap=float(
+                cfg.get("ensemble_disagreement_neutral_shrink_cap", 0.25)
+            ),
+            ensemble_std_cap_c=float(cfg.get("ensemble_std_cap_c", 2.0)),
+            ensemble_range_cap_c=float(cfg.get("ensemble_range_cap_c", 4.0)),
+            ensemble_enable_gate=bool(cfg.get("ensemble_enable_gate", True)),
+            ensemble_min_same_side_ratio=float(cfg.get("ensemble_min_same_side_ratio", 0.67)),
+            ensemble_max_std_c_for_trade=float(cfg.get("ensemble_max_std_c_for_trade", 2.5)),
+            ensemble_max_range_c_for_trade=float(cfg.get("ensemble_max_range_c_for_trade", 5.0)),
+            ensemble_enable_strike_disagreement_veto=bool(
+                cfg.get("ensemble_enable_strike_disagreement_veto", True)
+            ),
+            ensemble_min_size_multiplier=float(cfg.get("ensemble_min_size_multiplier", 0.75)),
+            ensemble_max_size_multiplier=float(cfg.get("ensemble_max_size_multiplier", 1.15)),
         )
         return apply_policy(
             candidates=candidates.copy(),

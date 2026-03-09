@@ -26,6 +26,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from live_trading import db as dbmod
 from live_trading.execution import DummyExecutionClient, RealExecutionClient
+from live_trading.forecast_progression import apply_pending_progression_updates, attach_progression_features
 from live_trading.policy import PolicyContext, apply_policy
 from live_trading.pricing import compute_pricing_decision
 from live_trading.reporting import generate_daily_report
@@ -85,6 +86,37 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "pause_on_stale_snapshots": True,
     "health_gate_alert_cooldown_minutes": 30,
     "top_n_per_event_day": 2,
+    "use_progression_confidence": True,
+    "progression_enable_gate": True,
+    "progression_min_cycles_seen": 3,
+    "progression_min_consecutive_candidate_cycles": 2,
+    "progression_enable_negative_veto": True,
+    "progression_negative_edge_trend_threshold": -0.01,
+    "progression_min_mode_consistency_ratio": 0.40,
+    "progression_negative_p_model_trend_threshold": 0.01,
+    "progression_weight_consecutive": 0.30,
+    "progression_weight_candidate_ratio": 0.20,
+    "progression_weight_edge_trend": 0.20,
+    "progression_weight_mode_consistency": 0.15,
+    "progression_weight_low_p_model": 0.10,
+    "progression_weight_low_edge_volatility": 0.05,
+    "progression_edge_trend_cap": 0.05,
+    "progression_enable_size_multiplier": True,
+    "progression_min_size_multiplier": 0.85,
+    "progression_max_size_multiplier": 1.35,
+    "use_ensemble_confidence": True,
+    "ensemble_probability_adjustment_enabled": True,
+    "ensemble_trade_size_adjustment_enabled": True,
+    "ensemble_disagreement_neutral_shrink_cap": 0.25,
+    "ensemble_std_cap_c": 2.0,
+    "ensemble_range_cap_c": 4.0,
+    "ensemble_enable_gate": True,
+    "ensemble_min_same_side_ratio": 0.67,
+    "ensemble_max_std_c_for_trade": 2.5,
+    "ensemble_max_range_c_for_trade": 5.0,
+    "ensemble_enable_strike_disagreement_veto": True,
+    "ensemble_min_size_multiplier": 0.75,
+    "ensemble_max_size_multiplier": 1.15,
     "stake_fraction": 0.005,
     "stake_cap_usd": 50,
     "drawdown_position_scaling": True,
@@ -678,6 +710,27 @@ def read_probability_files(path: Path) -> pd.DataFrame:
     return pd.concat(parts, ignore_index=True)
 
 
+def _coerce_bool_series(values: pd.Series, *, default: bool = False) -> pd.Series:
+    def _parse_one(v: Any) -> bool:
+        if v is None:
+            return default
+        if isinstance(v, bool):
+            return v
+        try:
+            if pd.isna(v):
+                return default
+        except Exception:
+            pass
+        txt = str(v).strip().lower()
+        if txt in {"1", "true", "t", "yes", "y"}:
+            return True
+        if txt in {"0", "false", "f", "no", "n"}:
+            return False
+        return default
+
+    return values.map(_parse_one)
+
+
 def standardize_probabilities(raw: pd.DataFrame) -> pd.DataFrame:
     out = raw.copy()
     if "slug" not in out.columns:
@@ -709,12 +762,26 @@ def standardize_probabilities(raw: pd.DataFrame) -> pd.DataFrame:
     else:
         raise SystemExit("Probability input must include strike_k or strike.")
 
-    if "p_model" in out.columns:
-        out["p_model"] = pd.to_numeric(out["p_model"], errors="coerce")
-    elif "p_model_residual" in out.columns:
-        out["p_model"] = pd.to_numeric(out["p_model_residual"], errors="coerce")
+    p_model_series: pd.Series | None = None
+    for c in ("p_model", "p_model_adjusted", "p_model_residual"):
+        if c in out.columns:
+            p_model_series = pd.to_numeric(out[c], errors="coerce")
+            break
+    if p_model_series is None:
+        raise SystemExit("Probability input must include p_model, p_model_adjusted, or p_model_residual.")
+    out["p_model"] = p_model_series
+
+    if "p_model_raw" in out.columns:
+        out["p_model_raw"] = pd.to_numeric(out["p_model_raw"], errors="coerce")
     else:
-        raise SystemExit("Probability input must include p_model or p_model_residual.")
+        out["p_model_raw"] = out["p_model"]
+    if "p_model_adjusted" in out.columns:
+        out["p_model_adjusted"] = pd.to_numeric(out["p_model_adjusted"], errors="coerce")
+    else:
+        out["p_model_adjusted"] = out["p_model"]
+
+    out["p_model_raw"] = out["p_model_raw"].where(out["p_model_raw"].notna(), out["p_model"])
+    out["p_model_adjusted"] = out["p_model_adjusted"].where(out["p_model_adjusted"].notna(), out["p_model"])
 
     if "mode_k" in out.columns:
         out["mode_k"] = pd.to_numeric(out["mode_k"], errors="coerce").astype("Int64")
@@ -738,6 +805,69 @@ def standardize_probabilities(raw: pd.DataFrame) -> pd.DataFrame:
     else:
         out["execution_time_utc"] = pd.to_datetime(execution_raw, utc=True, errors="coerce")
 
+    numeric_cols = [
+        "pred_model_1",
+        "pred_model_2",
+        "pred_model_3",
+        "ensemble_pred_median",
+        "ensemble_pred_mean",
+        "ensemble_pred_min",
+        "ensemble_pred_max",
+        "ensemble_pred_range",
+        "ensemble_pred_std",
+        "ensemble_pred_iqr",
+        "ensemble_bullish_count",
+        "ensemble_bearish_count",
+        "ensemble_agreement_score",
+        "ensemble_disagreement_score",
+        "ensemble_sign_agreement_ratio",
+        "ensemble_models_yes_count",
+        "ensemble_models_no_count",
+        "ensemble_same_side_ratio",
+        "ensemble_confidence_multiplier",
+        "ensemble_uncertainty_penalty",
+        "ensemble_size_multiplier",
+    ]
+    for col in numeric_cols:
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors="coerce")
+    for col in out.columns:
+        if col.startswith("pred_"):
+            out[col] = pd.to_numeric(out[col], errors="coerce")
+
+    for col in ("ensemble_cross_strike_disagreement", "ensemble_strike_disagreement_flag"):
+        if col in out.columns:
+            out[col] = _coerce_bool_series(out[col], default=False)
+
+    if "ensemble_fallback_marker" in out.columns:
+        out["ensemble_fallback_marker"] = out["ensemble_fallback_marker"].astype("string").fillna("")
+    else:
+        out["ensemble_fallback_marker"] = pd.Series([""] * len(out), dtype="string")
+
+    default_numeric = {
+        "ensemble_agreement_score": 0.5,
+        "ensemble_disagreement_score": 0.5,
+        "ensemble_sign_agreement_ratio": 0.5,
+        "ensemble_models_yes_count": 0.0,
+        "ensemble_models_no_count": 0.0,
+        "ensemble_same_side_ratio": 1.0,
+        "ensemble_confidence_multiplier": 1.0,
+        "ensemble_uncertainty_penalty": 0.0,
+        "ensemble_size_multiplier": 1.0,
+        "ensemble_bullish_count": 0.0,
+        "ensemble_bearish_count": 0.0,
+    }
+    for col, default in default_numeric.items():
+        if col not in out.columns:
+            out[col] = default
+        else:
+            out[col] = pd.to_numeric(out[col], errors="coerce").fillna(default)
+
+    if "ensemble_cross_strike_disagreement" not in out.columns:
+        out["ensemble_cross_strike_disagreement"] = False
+    if "ensemble_strike_disagreement_flag" not in out.columns:
+        out["ensemble_strike_disagreement_flag"] = False
+
     out = out.dropna(subset=["station", "date", "slug", "strike_k", "p_model"]).copy()
     out["station"] = out["station"].astype(str).str.strip()
     out = out.loc[out["station"] != ""].copy()
@@ -759,6 +889,11 @@ def standardize_probabilities(raw: pd.DataFrame) -> pd.DataFrame:
     out["mode_k"] = pd.to_numeric(out["mode_k"], errors="coerce").astype("Int64")
     out = out.dropna(subset=["mode_k"]).copy()
     out["mode_k"] = out["mode_k"].astype(int)
+
+    out["ensemble_models_yes_count"] = pd.to_numeric(out["ensemble_models_yes_count"], errors="coerce").fillna(0).astype(int)
+    out["ensemble_models_no_count"] = pd.to_numeric(out["ensemble_models_no_count"], errors="coerce").fillna(0).astype(int)
+    out["ensemble_bullish_count"] = pd.to_numeric(out["ensemble_bullish_count"], errors="coerce").fillna(0).astype(int)
+    out["ensemble_bearish_count"] = pd.to_numeric(out["ensemble_bearish_count"], errors="coerce").fillna(0).astype(int)
 
     out = out.sort_values(["station", "date", "event_key", "strike_k", "slug"], kind="mergesort")
     out = out.drop_duplicates(subset=["station", "date", "event_key", "strike_k", "slug"], keep="last")
@@ -854,6 +989,118 @@ def _clean_for_json(payload: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+def _as_float(value: Any) -> float | None:
+    try:
+        if value is None:
+            return None
+        out = float(value)
+        if math.isfinite(out):
+            return out
+    except Exception:
+        return None
+    return None
+
+
+def _as_int(value: Any) -> int | None:
+    try:
+        if value is None:
+            return None
+        return int(value)
+    except Exception:
+        return None
+
+
+def _fmt_num(value: Any, *, digits: int = 4) -> str:
+    val = _as_float(value)
+    if val is None:
+        return "na"
+    return f"{val:.{digits}f}"
+
+
+def _decision_reason_code(clean: dict[str, Any]) -> str:
+    decision = str(clean.get("decision", "")).strip().upper()
+    if decision == "SKIP":
+        reason = str(clean.get("skipped_reason") or "").strip()
+        return reason if reason else "skip_unknown"
+    if decision == "TRADE":
+        return "trade_approved"
+    if decision == "RESOLVE":
+        return str(clean.get("resolution") or "position_resolved")
+    return decision.lower() or "unknown"
+
+
+def _build_decision_explanation(clean: dict[str, Any]) -> str:
+    decision = str(clean.get("decision", "")).strip().upper()
+    reason = str(clean.get("skipped_reason") or "").strip()
+
+    edge = _as_float(clean.get("edge_after_price_check"))
+    if edge is None:
+        edge = _as_float(clean.get("edge"))
+    edge_th = _as_float(clean.get("edge_threshold"))
+    p_model = _as_float(clean.get("p_model"))
+    p_model_max = _as_float(clean.get("p_model_max"))
+    price = _as_float(clean.get("chosen_no_ask"))
+    max_no_price = _as_float(clean.get("max_no_price"))
+    strike_k = _as_int(clean.get("strike_k"))
+    mode_k = _as_int(clean.get("mode_k"))
+    mode_distance_min = _as_int(clean.get("mode_distance_min"))
+    mode_distance = None if strike_k is None or mode_k is None else abs(strike_k - mode_k)
+
+    progression_gate_reason = str(clean.get("progression_gate_reason") or "")
+    progression_mult = _as_float(clean.get("progression_confidence_multiplier"))
+    ensemble_gate_reason = str(clean.get("ensemble_gate_reason") or "")
+    ensemble_mult = _as_float(clean.get("ensemble_size_multiplier"))
+    size = _as_float(clean.get("size"))
+    stake = _as_float(clean.get("stake_usd"))
+
+    if decision == "TRADE":
+        parts = [
+            "Passed policy filters",
+            f"edge={_fmt_num(edge)} threshold={_fmt_num(edge_th)}",
+            f"p_model={_fmt_num(p_model)} max={_fmt_num(p_model_max)}",
+            f"price={_fmt_num(price)} max={_fmt_num(max_no_price)}",
+            f"mode_distance={mode_distance if mode_distance is not None else 'na'} min={mode_distance_min if mode_distance_min is not None else 'na'}",
+            f"progression={progression_gate_reason or 'pass'} mult={_fmt_num(progression_mult)}",
+            f"ensemble={ensemble_gate_reason or 'pass'} mult={_fmt_num(ensemble_mult)}",
+            f"size={_fmt_num(size, digits=2)} stake={_fmt_num(stake, digits=2)}",
+        ]
+        return "; ".join(parts)
+
+    if decision == "RESOLVE":
+        pnl = _as_float(clean.get("pnl_realized"))
+        resolution = str(clean.get("resolution") or "resolved")
+        return f"Position resolved: resolution={resolution} pnl={_fmt_num(pnl, digits=2)}"
+
+    if reason == "edge_too_low":
+        return f"Skipped: edge below threshold (edge={_fmt_num(edge)} threshold={_fmt_num(edge_th)})."
+    if reason == "p_model_too_high":
+        return f"Skipped: model probability too high (p_model={_fmt_num(p_model)} max={_fmt_num(p_model_max)})."
+    if reason == "mode_distance_fail":
+        return (
+            "Skipped: strike too close to mode "
+            f"(mode_distance={mode_distance if mode_distance is not None else 'na'} min={mode_distance_min if mode_distance_min is not None else 'na'})."
+        )
+    if reason == "price_too_high":
+        return f"Skipped: NO ask too high (price={_fmt_num(price)} max={_fmt_num(max_no_price)})."
+    if reason == "health_gate_blocked":
+        return f"Skipped: runtime health gate blocked trading ({clean.get('health_gate_reason') or 'unspecified'})."
+    if reason in {"ensemble_high_std", "ensemble_high_range", "ensemble_low_same_side_ratio", "ensemble_strike_disagreement"}:
+        return (
+            "Skipped: ensemble gate failed "
+            f"(reason={reason}, std={_fmt_num(clean.get('ensemble_pred_std'))}, range={_fmt_num(clean.get('ensemble_pred_range'))}, "
+            f"same_side={_fmt_num(clean.get('ensemble_same_side_ratio'))})."
+        )
+    if reason.startswith("progression_"):
+        return (
+            "Skipped: progression gate failed "
+            f"(reason={reason}, score={_fmt_num(clean.get('progression_confidence_score'))}, "
+            f"mult={_fmt_num(clean.get('progression_confidence_multiplier'))})."
+        )
+    if reason:
+        return f"Skipped: {reason}."
+    return "No trade decision without explicit reason."
+
+
 def _log_action(
     *,
     logger: logging.Logger,
@@ -863,14 +1110,17 @@ def _log_action(
     payload: dict[str, Any],
 ) -> None:
     clean = _clean_for_json(payload)
+    clean["decision_reason_code"] = _decision_reason_code(clean)
+    clean["decision_explanation"] = _build_decision_explanation(clean)
     logger.info(
-        "[%s] %s %s edge=%s price=%s reason=%s",
+        "[%s] %s %s reason_code=%s edge=%s price=%s explain=%s",
         clean.get("station"),
         clean.get("decision"),
         clean.get("slug") or clean.get("market_id"),
-        clean.get("edge"),
-        clean.get("chosen_no_ask"),
-        clean.get("skipped_reason") or "",
+        clean.get("decision_reason_code"),
+        _fmt_num(clean.get("edge_after_price_check") if clean.get("edge_after_price_check") is not None else clean.get("edge")),
+        _fmt_num(clean.get("chosen_no_ask")),
+        clean.get("decision_explanation"),
     )
 
     if jsonl_path is not None:
@@ -1111,6 +1361,15 @@ def _build_health_gate_blocked_policy(
     portfolio_risk_limit: float,
 ) -> pd.DataFrame:
     out = candidates.copy()
+    def _col_series(name: str, default: Any) -> pd.Series:
+        if name in out.columns:
+            return out[name]
+        return pd.Series([default] * len(out))
+
+    if "p_model_raw" not in out.columns:
+        out["p_model_raw"] = pd.to_numeric(out["p_model"], errors="coerce")
+    if "p_model_adjusted" not in out.columns:
+        out["p_model_adjusted"] = pd.to_numeric(out["p_model"], errors="coerce")
     out["NO_true"] = 1.0 - pd.to_numeric(out["p_model"], errors="coerce")
     out["edge"] = pd.NA
     out["decision"] = "SKIP"
@@ -1118,6 +1377,37 @@ def _build_health_gate_blocked_policy(
     out["health_gate_reason"] = str(reason_text)
     out["size"] = 0.0
     out["stake_usd"] = 0.0
+    out["base_size_before_progression"] = 0.0
+    out["final_size_after_progression"] = 0.0
+    out["base_stake_usd_before_progression"] = 0.0
+    out["final_stake_usd_after_progression"] = 0.0
+    out["final_size_after_ensemble"] = 0.0
+    out["final_stake_usd_after_ensemble"] = 0.0
+    out["progression_gate_pass"] = False
+    out["progression_gate_reason"] = "health_gate_blocked"
+    out["progression_confidence_score"] = 0.5
+    out["progression_confidence_multiplier"] = 1.0
+    out["ensemble_agreement_score"] = pd.to_numeric(_col_series("ensemble_agreement_score", 0.5), errors="coerce").fillna(0.5)
+    out["ensemble_disagreement_score"] = pd.to_numeric(_col_series("ensemble_disagreement_score", 0.5), errors="coerce").fillna(0.5)
+    out["ensemble_sign_agreement_ratio"] = pd.to_numeric(_col_series("ensemble_sign_agreement_ratio", 0.5), errors="coerce").fillna(0.5)
+    out["ensemble_cross_strike_disagreement"] = _coerce_bool_series(
+        _col_series("ensemble_cross_strike_disagreement", False),
+        default=False,
+    )
+    out["ensemble_models_yes_count"] = pd.to_numeric(_col_series("ensemble_models_yes_count", 0), errors="coerce").fillna(0).astype(int)
+    out["ensemble_models_no_count"] = pd.to_numeric(_col_series("ensemble_models_no_count", 0), errors="coerce").fillna(0).astype(int)
+    out["ensemble_same_side_ratio"] = pd.to_numeric(_col_series("ensemble_same_side_ratio", 1.0), errors="coerce").fillna(1.0)
+    out["ensemble_strike_disagreement_flag"] = _coerce_bool_series(
+        _col_series("ensemble_strike_disagreement_flag", False),
+        default=False,
+    )
+    out["ensemble_confidence_multiplier"] = pd.to_numeric(_col_series("ensemble_confidence_multiplier", 1.0), errors="coerce").fillna(1.0)
+    out["ensemble_uncertainty_penalty"] = pd.to_numeric(_col_series("ensemble_uncertainty_penalty", 0.0), errors="coerce").fillna(0.0)
+    out["ensemble_size_multiplier"] = pd.to_numeric(_col_series("ensemble_size_multiplier", 1.0), errors="coerce").fillna(1.0)
+    out["ensemble_gate_pass"] = False
+    out["ensemble_gate_reason"] = "health_gate_blocked"
+    if "ensemble_fallback_marker" not in out.columns:
+        out["ensemble_fallback_marker"] = ""
     out["risk_used_station_today"] = 0.0
     out["risk_used_station_daily"] = 0.0
     out["risk_used_station_open"] = 0.0
@@ -1198,6 +1488,32 @@ def run_cycle(
 ) -> None:
     now = utc_now()
     jsonl_path = output_dir / "logs" / f"trades_{to_yyyymmdd(now.date())}.jsonl" if bool(cfg.get("write_jsonl_log", True)) else None
+    pending_progression_dir = output_dir / "state" / "forecast_progression_pending"
+
+    processed_batches = apply_pending_progression_updates(
+        state_store.state,
+        pending_progression_dir,
+        logger=logger,
+    )
+    if processed_batches:
+        state_store.persist()
+        removed = 0
+        for batch_path in processed_batches:
+            try:
+                batch_path.unlink(missing_ok=True)
+                removed += 1
+            except Exception as exc:
+                logger.warning(
+                    "Failed to remove processed forecast progression batch path=%s error=%s: %s",
+                    batch_path,
+                    exc.__class__.__name__,
+                    exc,
+                )
+        logger.info(
+            "Applied %d queued forecast progression batch file(s), removed=%d",
+            len(processed_batches),
+            removed,
+        )
 
     prob_root_path = resolve_path(str(cfg.get("probabilities_path")))
     prob_path, manifest = resolve_probability_data_path(prob_root_path)
@@ -1278,6 +1594,7 @@ def run_cycle(
 
     records: list[dict[str, Any]] = []
     for row in universe.itertuples(index=False):
+        row_dict = row._asdict()
         market_day_ts = pd.to_datetime(row.market_day_local, errors="coerce")
         if pd.isna(market_day_ts):
             continue
@@ -1289,6 +1606,12 @@ def run_cycle(
             slippage_buffer_yes_fallback=float(cfg.get("slippage_buffer_yes_fallback", 0.01)),
             max_spread=float(cfg.get("max_spread", 0.05)),
         )
+        p_model_raw_val = row_dict.get("p_model_raw")
+        if p_model_raw_val is None or pd.isna(p_model_raw_val):
+            p_model_raw_val = row.p_model
+        p_model_adjusted_val = row_dict.get("p_model_adjusted")
+        if p_model_adjusted_val is None or pd.isna(p_model_adjusted_val):
+            p_model_adjusted_val = row.p_model
 
         record = {
             "ts_utc": now.isoformat(),
@@ -1301,6 +1624,8 @@ def run_cycle(
             "strike_k": int(row.strike_k),
             "mode_k": int(row.mode_k),
             "p_model": float(row.p_model),
+            "p_model_raw": float(p_model_raw_val),
+            "p_model_adjusted": float(p_model_adjusted_val),
             "execution_time_utc": pd.to_datetime(row.execution_time_utc, utc=True, errors="coerce").isoformat() if not pd.isna(pd.to_datetime(row.execution_time_utc, utc=True, errors="coerce")) else None,
             "snapshot_ts_utc": pricing.snapshot_ts_utc.isoformat() if pricing.snapshot_ts_utc else None,
             "snapshot_age_minutes": pricing.snapshot_age_minutes,
@@ -1313,17 +1638,81 @@ def run_cycle(
             "spread": pricing.spread,
             "snapshot_skip_reason": pricing.skipped_reason,
             "edge_threshold": float(cfg.get("edge_threshold", 0.02)),
+            "p_model_max": float(cfg.get("p_model_max", 0.12)),
+            "max_no_price": float(cfg.get("max_no_price", 0.92)),
+            "mode_distance_min": int(cfg.get("mode_distance_min", 2)),
             "NAV": float(state_store.nav_usd),
             "order_id": None,
             "order_status": None,
             "error": None,
         }
+        optional_numeric = [
+            "pred_model_1",
+            "pred_model_2",
+            "pred_model_3",
+            "ensemble_pred_median",
+            "ensemble_pred_mean",
+            "ensemble_pred_min",
+            "ensemble_pred_max",
+            "ensemble_pred_range",
+            "ensemble_pred_std",
+            "ensemble_pred_iqr",
+            "ensemble_bullish_count",
+            "ensemble_bearish_count",
+            "ensemble_agreement_score",
+            "ensemble_disagreement_score",
+            "ensemble_sign_agreement_ratio",
+            "ensemble_models_yes_count",
+            "ensemble_models_no_count",
+            "ensemble_same_side_ratio",
+            "ensemble_confidence_multiplier",
+            "ensemble_uncertainty_penalty",
+            "ensemble_size_multiplier",
+        ]
+        for key in optional_numeric:
+            value = row_dict.get(key)
+            if value is None or pd.isna(value):
+                continue
+            try:
+                record[key] = float(value)
+            except Exception:
+                pass
+
+        optional_bool = [
+            "ensemble_cross_strike_disagreement",
+            "ensemble_strike_disagreement_flag",
+            "ensemble_gate_pass",
+        ]
+        for key in optional_bool:
+            value = row_dict.get(key)
+            if value is None or pd.isna(value):
+                continue
+            record[key] = bool(value)
+
+        if row_dict.get("ensemble_gate_reason") is not None and not pd.isna(row_dict.get("ensemble_gate_reason")):
+            record["ensemble_gate_reason"] = str(row_dict.get("ensemble_gate_reason"))
+        if row_dict.get("ensemble_fallback_marker") is not None and not pd.isna(row_dict.get("ensemble_fallback_marker")):
+            record["ensemble_fallback_marker"] = str(row_dict.get("ensemble_fallback_marker"))
+
+        for key, value in row_dict.items():
+            if not key.startswith("pred_"):
+                continue
+            if key in record:
+                continue
+            if value is None or pd.isna(value):
+                continue
+            try:
+                record[key] = float(value)
+            except Exception:
+                continue
         records.append(record)
 
     candidates = pd.DataFrame.from_records(records)
     if candidates.empty:
         logger.info("No candidates generated")
         return
+
+    candidates = attach_progression_features(state_store.state, candidates)
 
     if health_gate_blocked:
         nav_usd = float(state_store.nav_usd)
@@ -1355,6 +1744,51 @@ def run_cycle(
             min_drawdown_scale=float(cfg.get("min_drawdown_scale", 0.25)),
             trade_window_start_local=str(cfg.get("trade_window", {}).get("start_local", "00:00")),
             trade_window_end_local=str(cfg.get("trade_window", {}).get("end_local", "12:00")),
+            use_progression_confidence=bool(cfg.get("use_progression_confidence", True)),
+            progression_enable_gate=bool(cfg.get("progression_enable_gate", True)),
+            progression_min_cycles_seen=int(cfg.get("progression_min_cycles_seen", 3)),
+            progression_min_consecutive_candidate_cycles=int(
+                cfg.get("progression_min_consecutive_candidate_cycles", 2)
+            ),
+            progression_enable_negative_veto=bool(cfg.get("progression_enable_negative_veto", True)),
+            progression_negative_edge_trend_threshold=float(
+                cfg.get("progression_negative_edge_trend_threshold", -0.01)
+            ),
+            progression_min_mode_consistency_ratio=float(cfg.get("progression_min_mode_consistency_ratio", 0.40)),
+            progression_negative_p_model_trend_threshold=float(
+                cfg.get("progression_negative_p_model_trend_threshold", 0.01)
+            ),
+            progression_weight_consecutive=float(cfg.get("progression_weight_consecutive", 0.30)),
+            progression_weight_candidate_ratio=float(cfg.get("progression_weight_candidate_ratio", 0.20)),
+            progression_weight_edge_trend=float(cfg.get("progression_weight_edge_trend", 0.20)),
+            progression_weight_mode_consistency=float(cfg.get("progression_weight_mode_consistency", 0.15)),
+            progression_weight_low_p_model=float(cfg.get("progression_weight_low_p_model", 0.10)),
+            progression_weight_low_edge_volatility=float(cfg.get("progression_weight_low_edge_volatility", 0.05)),
+            progression_edge_trend_cap=float(cfg.get("progression_edge_trend_cap", 0.05)),
+            progression_enable_size_multiplier=bool(cfg.get("progression_enable_size_multiplier", True)),
+            progression_min_size_multiplier=float(cfg.get("progression_min_size_multiplier", 0.85)),
+            progression_max_size_multiplier=float(cfg.get("progression_max_size_multiplier", 1.35)),
+            use_ensemble_confidence=bool(cfg.get("use_ensemble_confidence", True)),
+            ensemble_probability_adjustment_enabled=bool(
+                cfg.get("ensemble_probability_adjustment_enabled", True)
+            ),
+            ensemble_trade_size_adjustment_enabled=bool(
+                cfg.get("ensemble_trade_size_adjustment_enabled", True)
+            ),
+            ensemble_disagreement_neutral_shrink_cap=float(
+                cfg.get("ensemble_disagreement_neutral_shrink_cap", 0.25)
+            ),
+            ensemble_std_cap_c=float(cfg.get("ensemble_std_cap_c", 2.0)),
+            ensemble_range_cap_c=float(cfg.get("ensemble_range_cap_c", 4.0)),
+            ensemble_enable_gate=bool(cfg.get("ensemble_enable_gate", True)),
+            ensemble_min_same_side_ratio=float(cfg.get("ensemble_min_same_side_ratio", 0.67)),
+            ensemble_max_std_c_for_trade=float(cfg.get("ensemble_max_std_c_for_trade", 2.5)),
+            ensemble_max_range_c_for_trade=float(cfg.get("ensemble_max_range_c_for_trade", 5.0)),
+            ensemble_enable_strike_disagreement_veto=bool(
+                cfg.get("ensemble_enable_strike_disagreement_veto", True)
+            ),
+            ensemble_min_size_multiplier=float(cfg.get("ensemble_min_size_multiplier", 0.75)),
+            ensemble_max_size_multiplier=float(cfg.get("ensemble_max_size_multiplier", 1.15)),
         )
 
         policy_out = apply_policy(

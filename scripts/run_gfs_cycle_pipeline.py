@@ -28,7 +28,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Run the per-cycle GFS pipeline in order: raw extraction, model predictions, "
-            "live market probabilities, and forecast progression report."
+            "live market probabilities, progression state update, and forecast progression report."
         )
     )
     parser.add_argument(
@@ -177,6 +177,15 @@ def build_commands(
             cycle,
             "--calibration-version",
             calibration_version,
+        ]
+    )
+
+    commands.append(
+        [
+            str(python_bin),
+            str(scripts_dir / "update_forecast_progression_state.py"),
+            "--cycle",
+            cycle,
         ]
     )
 

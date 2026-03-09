@@ -106,6 +106,45 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=100,
         help="Minimum residual history rows required per station (default: 100).",
     )
+    parser.add_argument(
+        "--use-ensemble-confidence",
+        type=parse_bool,
+        default=True,
+        help="Enable ensemble-derived confidence/uncertainty features (default: true).",
+    )
+    parser.add_argument(
+        "--ensemble-probability-adjustment-enabled",
+        type=parse_bool,
+        default=True,
+        help="Enable conservative probability shrink toward 0.5 using ensemble disagreement (default: true).",
+    )
+    parser.add_argument(
+        "--ensemble-trade-size-adjustment-enabled",
+        type=parse_bool,
+        default=True,
+        help=(
+            "Expose ensemble confidence for downstream trade sizing (diagnostic/config passthrough). "
+            "Probability generation is unchanged by this flag."
+        ),
+    )
+    parser.add_argument(
+        "--ensemble-disagreement-neutral-shrink-cap",
+        type=float,
+        default=0.25,
+        help="Max shrink strength toward 0.5 at maximal disagreement (default: 0.25).",
+    )
+    parser.add_argument(
+        "--ensemble-std-cap-c",
+        type=float,
+        default=2.0,
+        help="Std cap (deg C) for disagreement normalization (default: 2.0).",
+    )
+    parser.add_argument(
+        "--ensemble-range-cap-c",
+        type=float,
+        default=4.0,
+        help="Range cap (deg C) for disagreement normalization (default: 4.0).",
+    )
     return parser.parse_args(argv)
 
 
@@ -166,6 +205,222 @@ def parse_statuses(text: str) -> list[str]:
     if not statuses:
         raise SystemExit("At least one status must be provided via --statuses.")
     return statuses
+
+
+def parse_bool(value: str | bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in {"1", "true", "t", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "f", "no", "n", "off"}:
+        return False
+    raise argparse.ArgumentTypeError(f"Invalid boolean value: {value!r}")
+
+
+def _cap_or_eps(value: float) -> float:
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        out = 0.0
+    return max(PROB_EPS, out)
+
+
+def _normalize_disagreement_components(
+    *,
+    std_vals: np.ndarray,
+    range_vals: np.ndarray,
+    iqr_vals: np.ndarray,
+    std_cap_c: float,
+    range_cap_c: float,
+) -> np.ndarray:
+    std_cap = _cap_or_eps(std_cap_c)
+    range_cap = _cap_or_eps(range_cap_c)
+    iqr_cap = _cap_or_eps(range_cap * 0.5)
+    std_n = np.clip(std_vals / std_cap, 0.0, 1.0)
+    range_n = np.clip(range_vals / range_cap, 0.0, 1.0)
+    iqr_n = np.clip(iqr_vals / iqr_cap, 0.0, 1.0)
+    return np.clip((std_n + range_n + iqr_n) / 3.0, 0.0, 1.0)
+
+
+def compute_ensemble_prediction_features(
+    df: pd.DataFrame,
+    *,
+    pred_cols: list[str],
+    std_cap_c: float,
+    range_cap_c: float,
+) -> pd.DataFrame:
+    out = df.copy()
+
+    if not pred_cols:
+        out["ensemble_model_count"] = 0
+        out["ensemble_pred_median"] = np.nan
+        out["ensemble_pred_mean"] = np.nan
+        out["ensemble_pred_min"] = np.nan
+        out["ensemble_pred_max"] = np.nan
+        out["ensemble_pred_range"] = np.nan
+        out["ensemble_pred_std"] = np.nan
+        out["ensemble_pred_iqr"] = np.nan
+        out["ensemble_bullish_count"] = 0
+        out["ensemble_bearish_count"] = 0
+        out["ensemble_agreement_score"] = 0.5
+        out["ensemble_disagreement_score"] = 0.5
+        out["ensemble_sign_agreement_ratio"] = 0.5
+        out["ensemble_cross_strike_disagreement"] = False
+        out["ensemble_fallback_marker"] = "ensemble_prediction_missing"
+        return out
+
+    preds = out[pred_cols].to_numpy(dtype=float)
+    model_count = int(preds.shape[1])
+    med = np.median(preds, axis=1)
+    mean = np.mean(preds, axis=1)
+    min_vals = np.min(preds, axis=1)
+    max_vals = np.max(preds, axis=1)
+    range_vals = max_vals - min_vals
+    std_vals = np.std(preds, axis=1)
+    q25 = np.percentile(preds, 25, axis=1)
+    q75 = np.percentile(preds, 75, axis=1)
+    iqr_vals = q75 - q25
+
+    above = np.sum(preds > med[:, None], axis=1)
+    below = np.sum(preds < med[:, None], axis=1)
+    equal = np.sum(np.isclose(preds, med[:, None]), axis=1)
+    sign_agreement_ratio = np.maximum(np.maximum(above, below), equal) / max(1.0, float(model_count))
+    disagreement = _normalize_disagreement_components(
+        std_vals=std_vals,
+        range_vals=range_vals,
+        iqr_vals=iqr_vals,
+        std_cap_c=std_cap_c,
+        range_cap_c=range_cap_c,
+    )
+
+    out["ensemble_model_count"] = model_count
+    out["ensemble_pred_median"] = med
+    out["ensemble_pred_mean"] = mean
+    out["ensemble_pred_min"] = min_vals
+    out["ensemble_pred_max"] = max_vals
+    out["ensemble_pred_range"] = range_vals
+    out["ensemble_pred_std"] = std_vals
+    out["ensemble_pred_iqr"] = iqr_vals
+    out["ensemble_bullish_count"] = above.astype(int)
+    out["ensemble_bearish_count"] = below.astype(int)
+    out["ensemble_agreement_score"] = np.clip(1.0 - disagreement, 0.0, 1.0)
+    out["ensemble_disagreement_score"] = disagreement
+    out["ensemble_sign_agreement_ratio"] = np.clip(sign_agreement_ratio, 0.0, 1.0)
+    out["ensemble_cross_strike_disagreement"] = False
+    out["ensemble_fallback_marker"] = ""
+    return out
+
+
+def add_strike_level_ensemble_features(
+    df: pd.DataFrame,
+    *,
+    pred_cols: list[str],
+) -> pd.DataFrame:
+    out = df.copy()
+    out["ensemble_models_yes_count"] = 0
+    out["ensemble_models_no_count"] = 0
+    out["ensemble_same_side_ratio"] = 1.0
+    out["ensemble_strike_disagreement_flag"] = False
+
+    if not pred_cols or out.empty:
+        return out
+
+    preds = out[pred_cols].to_numpy(dtype=float)
+    model_count = int(preds.shape[1])
+    if model_count <= 0:
+        return out
+
+    lower = pd.to_numeric(out["lower_c"], errors="coerce").to_numpy(dtype=float)[:, None]
+    upper = pd.to_numeric(out["upper_c"], errors="coerce").to_numpy(dtype=float)[:, None]
+    strike = pd.to_numeric(out["strike_k"], errors="coerce").to_numpy(dtype=float)[:, None]
+
+    yes = np.ones_like(preds, dtype=bool)
+    lower_finite = np.isfinite(lower)
+    upper_finite = np.isfinite(upper)
+    yes = yes & ((~lower_finite) | (preds >= lower))
+    yes = yes & ((~upper_finite) | (preds < upper))
+
+    yes_count = yes.sum(axis=1).astype(int)
+    no_count = (model_count - yes_count).astype(int)
+    same_side = np.maximum(yes_count, no_count) / float(model_count)
+    disagreement_flag = (yes_count > 0) & (yes_count < model_count)
+
+    out["ensemble_models_yes_count"] = yes_count
+    out["ensemble_models_no_count"] = no_count
+    out["ensemble_same_side_ratio"] = np.clip(same_side, 0.0, 1.0)
+    out["ensemble_strike_disagreement_flag"] = disagreement_flag
+    out["ensemble_cross_strike_disagreement"] = disagreement_flag
+
+    bullish_count = np.sum(preds > strike, axis=1).astype(int)
+    bearish_count = np.sum(preds < strike, axis=1).astype(int)
+    out["ensemble_bullish_count"] = bullish_count
+    out["ensemble_bearish_count"] = bearish_count
+    return out
+
+
+def apply_ensemble_probability_adjustment(
+    df: pd.DataFrame,
+    *,
+    use_ensemble_confidence: bool,
+    adjustment_enabled: bool,
+    disagreement_neutral_shrink_cap: float,
+) -> pd.DataFrame:
+    out = df.copy()
+    p_raw = np.clip(
+        pd.to_numeric(out.get("p_model_raw"), errors="coerce").to_numpy(dtype=float),
+        PROB_EPS,
+        1.0 - PROB_EPS,
+    )
+
+    if not use_ensemble_confidence:
+        out["ensemble_uncertainty_penalty"] = 0.0
+        out["ensemble_confidence_multiplier"] = 1.0
+        out["p_model_adjusted"] = p_raw
+        out["p_model"] = p_raw
+        fallback = out.get("ensemble_fallback_marker")
+        if fallback is None:
+            fallback_series = pd.Series([""] * len(out), dtype="string")
+        else:
+            fallback_series = fallback.astype("string").fillna("")
+        fallback_series = fallback_series.mask(
+            fallback_series == "",
+            "ensemble_confidence_disabled",
+        )
+        out["ensemble_fallback_marker"] = fallback_series
+        return out
+
+    disagreement_raw = pd.to_numeric(out.get("ensemble_disagreement_score"), errors="coerce")
+    disagreement_arr = disagreement_raw.to_numpy(dtype=float)
+    valid = np.isfinite(disagreement_arr)
+    disagreement_clipped = np.clip(np.where(valid, disagreement_arr, 0.0), 0.0, 1.0)
+
+    shrink_cap = min(1.0, max(0.0, float(disagreement_neutral_shrink_cap)))
+    uncertainty_penalty = disagreement_clipped * shrink_cap
+    confidence_multiplier = 1.0 - uncertainty_penalty
+
+    if adjustment_enabled:
+        p_adjusted = 0.5 + (p_raw - 0.5) * confidence_multiplier
+        p_adjusted = np.clip(p_adjusted, PROB_EPS, 1.0 - PROB_EPS)
+    else:
+        p_adjusted = p_raw
+
+    out["ensemble_uncertainty_penalty"] = np.where(valid, uncertainty_penalty, 0.0)
+    out["ensemble_confidence_multiplier"] = np.where(valid, confidence_multiplier, 1.0)
+    out["p_model_adjusted"] = p_adjusted
+    out["p_model"] = out["p_model_adjusted"] if adjustment_enabled else p_raw
+
+    fallback = out.get("ensemble_fallback_marker")
+    if fallback is None:
+        fallback_series = pd.Series([""] * len(out), dtype="string")
+    else:
+        fallback_series = fallback.astype("string").fillna("")
+    fallback_series = fallback_series.where(
+        valid | (fallback_series != ""),
+        "ensemble_neutral_fallback_missing_disagreement",
+    )
+    out["ensemble_fallback_marker"] = fallback_series
+    return out
 
 
 def detect_prediction_stations(predictions_root: Path, model_names: list[str]) -> set[str]:
@@ -504,8 +759,16 @@ def build_eval_daily_forecast(*, predictions_root: Path, station: str, timezone:
     if merged is None or merged.empty:
         return pd.DataFrame()
 
-    preds = merged[pred_cols].to_numpy(dtype=float)
-    merged["t_hat_median"] = np.median(preds, axis=1)
+    for idx, col in enumerate(pred_cols[:3], start=1):
+        merged[f"pred_model_{idx}"] = pd.to_numeric(merged[col], errors="coerce")
+
+    merged = compute_ensemble_prediction_features(
+        merged,
+        pred_cols=pred_cols,
+        std_cap_c=2.0,
+        range_cap_c=4.0,
+    )
+    merged["t_hat_median"] = pd.to_numeric(merged["ensemble_pred_median"], errors="coerce")
     merged = merged.sort_values(DATE_COLUMN, kind="mergesort")
     return merged
 
@@ -518,6 +781,12 @@ def build_station_probabilities(
     predictions_root: Path,
     model_names: list[str],
     residual_cdf: EmpiricalResidualCdf,
+    use_ensemble_confidence: bool,
+    ensemble_probability_adjustment_enabled: bool,
+    ensemble_disagreement_neutral_shrink_cap: float,
+    ensemble_std_cap_c: float,
+    ensemble_range_cap_c: float,
+    ensemble_trade_size_adjustment_enabled: bool,
 ) -> pd.DataFrame:
     eval_daily = build_eval_daily_forecast(
         predictions_root=predictions_root,
@@ -529,7 +798,7 @@ def build_station_probabilities(
         return pd.DataFrame()
 
     eval_df = station_markets.merge(
-        eval_daily[[DATE_COLUMN, "execution_time_utc", "t_hat_median"]],
+        eval_daily,
         left_on="market_day_local",
         right_on=DATE_COLUMN,
         how="inner",
@@ -537,14 +806,48 @@ def build_station_probabilities(
     if eval_df.empty:
         return pd.DataFrame()
 
-    lower = pd.to_numeric(eval_df["lower_c"], errors="coerce").to_numpy(dtype=float) - eval_df["t_hat_median"].to_numpy(dtype=float)
-    upper = pd.to_numeric(eval_df["upper_c"], errors="coerce").to_numpy(dtype=float) - eval_df["t_hat_median"].to_numpy(dtype=float)
-    eval_df["p_model"] = residual_cdf.interval_prob(lower=lower, upper=upper)
-    eval_df["p_model"] = np.clip(eval_df["p_model"].to_numpy(dtype=float), PROB_EPS, 1.0 - PROB_EPS)
+    pred_cols = [f"pred_{name}" for name in model_names if f"pred_{name}" in eval_df.columns]
+    if not pred_cols:
+        pred_cols = [c for c in eval_df.columns if c.startswith("pred_model_")]
+
+    if "ensemble_pred_median" not in eval_df.columns:
+        eval_df = compute_ensemble_prediction_features(
+            eval_df,
+            pred_cols=pred_cols,
+            std_cap_c=ensemble_std_cap_c,
+            range_cap_c=ensemble_range_cap_c,
+        )
+    else:
+        # Recompute disagreement normalization with runtime caps so tuning is controlled by config.
+        disagreement = _normalize_disagreement_components(
+            std_vals=pd.to_numeric(eval_df["ensemble_pred_std"], errors="coerce").to_numpy(dtype=float),
+            range_vals=pd.to_numeric(eval_df["ensemble_pred_range"], errors="coerce").to_numpy(dtype=float),
+            iqr_vals=pd.to_numeric(eval_df["ensemble_pred_iqr"], errors="coerce").to_numpy(dtype=float),
+            std_cap_c=ensemble_std_cap_c,
+            range_cap_c=ensemble_range_cap_c,
+        )
+        eval_df["ensemble_disagreement_score"] = disagreement
+        eval_df["ensemble_agreement_score"] = np.clip(1.0 - disagreement, 0.0, 1.0)
+        if "ensemble_fallback_marker" not in eval_df.columns:
+            eval_df["ensemble_fallback_marker"] = ""
+
+    eval_df = add_strike_level_ensemble_features(eval_df, pred_cols=pred_cols)
+
+    t_hat = pd.to_numeric(eval_df.get("ensemble_pred_median"), errors="coerce")
+    lower = pd.to_numeric(eval_df["lower_c"], errors="coerce").to_numpy(dtype=float) - t_hat.to_numpy(dtype=float)
+    upper = pd.to_numeric(eval_df["upper_c"], errors="coerce").to_numpy(dtype=float) - t_hat.to_numpy(dtype=float)
+    eval_df["p_model_raw"] = residual_cdf.interval_prob(lower=lower, upper=upper)
+    eval_df["p_model_raw"] = np.clip(eval_df["p_model_raw"].to_numpy(dtype=float), PROB_EPS, 1.0 - PROB_EPS)
+    eval_df = apply_ensemble_probability_adjustment(
+        eval_df,
+        use_ensemble_confidence=use_ensemble_confidence,
+        adjustment_enabled=ensemble_probability_adjustment_enabled,
+        disagreement_neutral_shrink_cap=ensemble_disagreement_neutral_shrink_cap,
+    )
 
     mode_df = (
         eval_df.sort_values(
-            ["market_day_local", "event_key", "p_model", "strike_k"],
+            ["market_day_local", "event_key", "p_model_adjusted", "strike_k"],
             ascending=[True, True, False, True],
             kind="mergesort",
         )
@@ -555,6 +858,8 @@ def build_station_probabilities(
     eval_df = eval_df.merge(mode_df, on=["market_day_local", "event_key"], how="left")
     eval_df["station_name"] = station
     eval_df["date"] = eval_df["market_day_local"]
+    eval_df["t_hat_median"] = t_hat
+    eval_df["ensemble_trade_size_adjustment_enabled"] = bool(ensemble_trade_size_adjustment_enabled)
     return eval_df
 
 
@@ -728,6 +1033,13 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Statuses: {', '.join(statuses)}")
     print(f"Calibration version: {calibration_version}")
     print(f"Frozen calibration snapshot: {calibration_snapshot_path}")
+    print(f"Use ensemble confidence: {bool(args.use_ensemble_confidence)}")
+    print(f"Ensemble probability adjustment enabled: {bool(args.ensemble_probability_adjustment_enabled)}")
+    print(f"Ensemble disagreement shrink cap: {float(args.ensemble_disagreement_neutral_shrink_cap):.3f}")
+    print(
+        "Ensemble disagreement caps std/range (C): "
+        f"{float(args.ensemble_std_cap_c):.3f}/{float(args.ensemble_range_cap_c):.3f}"
+    )
 
     from master_db import resolve_master_postgres_dsn
 
@@ -763,6 +1075,12 @@ def main(argv: list[str] | None = None) -> int:
             predictions_root=args.predictions_root,
             model_names=model_names,
             residual_cdf=residual_cdfs[cdf_station_name],
+            use_ensemble_confidence=bool(args.use_ensemble_confidence),
+            ensemble_probability_adjustment_enabled=bool(args.ensemble_probability_adjustment_enabled),
+            ensemble_disagreement_neutral_shrink_cap=float(args.ensemble_disagreement_neutral_shrink_cap),
+            ensemble_std_cap_c=float(args.ensemble_std_cap_c),
+            ensemble_range_cap_c=float(args.ensemble_range_cap_c),
+            ensemble_trade_size_adjustment_enabled=bool(args.ensemble_trade_size_adjustment_enabled),
         )
         if not station_probs.empty:
             probs_parts.append(station_probs)
@@ -797,6 +1115,33 @@ def main(argv: list[str] | None = None) -> int:
     out = out.sort_values(["station_name", "date", "event_key", "strike_k", "market_id"], kind="mergesort")
     out = out.drop_duplicates(subset=["market_id"], keep="last")
 
+    pred_cols_ordered = [f"pred_{name}" for name in model_names if f"pred_{name}" in out.columns]
+    pred_alias_cols = [c for c in ("pred_model_1", "pred_model_2", "pred_model_3") if c in out.columns]
+    ensemble_cols = [
+        "ensemble_pred_median",
+        "ensemble_pred_mean",
+        "ensemble_pred_min",
+        "ensemble_pred_max",
+        "ensemble_pred_range",
+        "ensemble_pred_std",
+        "ensemble_pred_iqr",
+        "ensemble_bullish_count",
+        "ensemble_bearish_count",
+        "ensemble_agreement_score",
+        "ensemble_disagreement_score",
+        "ensemble_sign_agreement_ratio",
+        "ensemble_cross_strike_disagreement",
+        "ensemble_models_yes_count",
+        "ensemble_models_no_count",
+        "ensemble_same_side_ratio",
+        "ensemble_strike_disagreement_flag",
+        "ensemble_confidence_multiplier",
+        "ensemble_uncertainty_penalty",
+        "ensemble_trade_size_adjustment_enabled",
+        "ensemble_fallback_marker",
+    ]
+    ensemble_cols = [c for c in ensemble_cols if c in out.columns]
+
     output_cols = [
         "market_id",
         "slug",
@@ -809,12 +1154,18 @@ def main(argv: list[str] | None = None) -> int:
         "strike_k",
         "mode_k",
         "p_model",
+        "p_model_raw",
+        "p_model_adjusted",
         "t_hat_median",
         "execution_time_utc",
         "lower_c",
         "upper_c",
         "end_date_utc",
     ]
+    output_cols.extend(pred_alias_cols)
+    output_cols.extend(pred_cols_ordered)
+    output_cols.extend(ensemble_cols)
+    output_cols = [c for c in output_cols if c in out.columns]
     out_final = out[output_cols].copy().rename(columns={"t_hat_median": "T_hat"})
 
     station_counts = (
@@ -861,6 +1212,12 @@ def main(argv: list[str] | None = None) -> int:
         "models": list(model_names),
         "statuses": list(statuses),
         "min_residual_history": int(args.min_residual_history),
+        "use_ensemble_confidence": bool(args.use_ensemble_confidence),
+        "ensemble_probability_adjustment_enabled": bool(args.ensemble_probability_adjustment_enabled),
+        "ensemble_trade_size_adjustment_enabled": bool(args.ensemble_trade_size_adjustment_enabled),
+        "ensemble_disagreement_neutral_shrink_cap": float(args.ensemble_disagreement_neutral_shrink_cap),
+        "ensemble_std_cap_c": float(args.ensemble_std_cap_c),
+        "ensemble_range_cap_c": float(args.ensemble_range_cap_c),
         "predictions_root": str(args.predictions_root.resolve()),
         "residuals_path": str(calibration_snapshot_path.resolve()),
         "calibration_manifest_file": str((Path("calibrations") / calibration_version / "manifest.json").as_posix()),
