@@ -10,8 +10,10 @@ import sys
 import time
 import traceback
 import uuid
+from collections import Counter
 from collections.abc import Mapping
 from datetime import date, datetime, timedelta
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -63,6 +65,7 @@ GENERIC_DIR_NAMES = {
     "outputs",
 }
 ORDER_KEY_RETENTION_HOURS = 24.0
+POSITION_EPS = 1e-9
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "mode": "paper",
@@ -82,6 +85,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "price_drift_tolerance": 0.01,
     "max_probability_age_days": 2,
     "max_snapshot_age_minutes": 30,
+    "snapshot_quote_lookback_per_outcome": 12,
     "pause_on_stale_probabilities": True,
     "pause_on_stale_snapshots": True,
     "health_gate_alert_cooldown_minutes": 30,
@@ -126,6 +130,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "portfolio_daily_risk_fraction": 0.05,
     "stoploss_daily_pnl_fraction": 0.01,
     "stoploss_consecutive_days": 3,
+    "trade_stoploss": {
+        "enabled": True,
+        "loss_fraction": 0.25,
+        "break_even_on_recovery": True,
+    },
     "max_open_positions_per_station": 4,
     "max_open_positions_total": 20,
     "trade_cooldown_minutes": 30,
@@ -143,6 +152,13 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "lookahead_days": 4,
     "trade_window": {"start_local": "00:00", "end_local": "12:00"},
     "log_level": "INFO",
+    "log_to_stdout": True,
+    "log_file": "",
+    "log_rotate_max_mb": 128,
+    "log_rotate_backups": 20,
+    "log_skip_decisions_at_info": False,
+    "log_cycle_decision_summary": True,
+    "log_cycle_summary_top_skip_reasons": 6,
     "write_jsonl_log": True,
     "write_csv_trades": True,
     "daily_report_time_local": "23:59",
@@ -375,19 +391,40 @@ def resolve_probability_data_path(path: Path) -> tuple[Path, dict[str, Any] | No
     raise SystemExit(f"Probabilities path not found: {path}")
 
 
-def setup_logger(log_path: Path, level: str) -> logging.Logger:
+def setup_logger(
+    log_path: Path,
+    level: str,
+    *,
+    rotate_max_mb: int = 128,
+    rotate_backups: int = 20,
+    to_stdout: bool = True,
+) -> logging.Logger:
     logger = logging.getLogger("live_pilot")
-    logger.handlers = []
+    for handler in list(logger.handlers):
+        logger.removeHandler(handler)
+        try:
+            handler.close()
+        except Exception:
+            pass
+    logger.propagate = False
     logger.setLevel(getattr(logging, str(level).upper(), logging.INFO))
 
     formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
-    file_handler = logging.FileHandler(log_path, encoding="utf-8")
+    max_bytes = max(1, int(rotate_max_mb)) * 1024 * 1024
+    backup_count = max(1, int(rotate_backups))
+    file_handler = RotatingFileHandler(
+        log_path,
+        maxBytes=max_bytes,
+        backupCount=backup_count,
+        encoding="utf-8",
+    )
     file_handler.setFormatter(formatter)
     logger.addHandler(file_handler)
 
-    stream_handler = logging.StreamHandler(sys.stdout)
-    stream_handler.setFormatter(formatter)
-    logger.addHandler(stream_handler)
+    if to_stdout:
+        stream_handler = logging.StreamHandler(sys.stdout)
+        stream_handler.setFormatter(formatter)
+        logger.addHandler(stream_handler)
     return logger
 
 
@@ -481,13 +518,51 @@ def _to_day_iso(value: Any) -> str | None:
     return ts.date().isoformat()
 
 
+def _safe_int(value: Any) -> int | None:
+    try:
+        return int(value)
+    except Exception:
+        return None
+
+
+def _normalize_text(value: Any) -> str:
+    if value is None:
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except Exception:
+        pass
+    return str(value).strip()
+
+
+def _normalize_slug(value: Any) -> str:
+    return _normalize_text(value).lower()
+
+
+def _normalize_event_key(value: Any, *, slug_fallback: Any = None) -> str:
+    event_key = _normalize_text(value)
+    if not event_key and slug_fallback is not None:
+        slug_text = _normalize_text(slug_fallback)
+        if slug_text:
+            event_key = _derive_event_key(slug_text)
+    return event_key.strip().lower()
+
+
+def _market_id_sort_key(value: Any) -> int:
+    text = _normalize_text(value)
+    if not text:
+        return -1
+    try:
+        return int(text)
+    except Exception:
+        return -1
+
+
 def _build_order_key(payload: Mapping[str, Any]) -> str | None:
     station_key = normalize_station_key(str(payload.get("station") or ""))
     market_day_local = _to_day_iso(payload.get("market_day_local"))
-    try:
-        strike_k = int(payload.get("strike_k"))
-    except Exception:
-        strike_k = None
+    strike_k = _safe_int(payload.get("strike_k"))
     try:
         chosen_no_ask = float(payload.get("chosen_no_ask"))
     except Exception:
@@ -508,6 +583,80 @@ def _build_order_key(payload: Mapping[str, Any]) -> str | None:
             outcome,
         ]
     )
+
+
+def _build_execution_client(cfg: Mapping[str, Any]) -> Any:
+    mode = str(cfg.get("mode", "paper")).lower()
+    if mode == "paper":
+        return DummyExecutionClient(
+            price_tick=float(cfg.get("price_tick", 0.001)),
+            conservative_fill=True,
+            realism_enabled=bool(cfg.get("paper_execution_realism", True)),
+            deterministic_seed=int(cfg.get("paper_execution_random_seed", 0)),
+            fill_probability_base=float(cfg.get("paper_fill_probability_base", 0.9)),
+            partial_fill_probability=float(cfg.get("paper_partial_fill_probability", 0.2)),
+            max_slippage_ticks=int(cfg.get("paper_max_slippage_ticks", 3)),
+        )
+    if mode == "live":
+        return RealExecutionClient()
+    raise SystemExit(f"Invalid mode: {mode}")
+
+
+def _trade_stoploss_settings(cfg: Mapping[str, Any]) -> tuple[bool, float, bool]:
+    raw = cfg.get("trade_stoploss", {})
+    if not isinstance(raw, Mapping):
+        raw = {}
+    enabled = bool(raw.get("enabled", True))
+    try:
+        loss_fraction = abs(float(raw.get("loss_fraction", 0.25)))
+    except Exception:
+        loss_fraction = 0.25
+    loss_fraction = min(0.99, max(0.0, loss_fraction))
+    break_even_on_recovery = bool(raw.get("break_even_on_recovery", True))
+    return enabled, loss_fraction, break_even_on_recovery
+
+
+def _parse_snapshot_ts(value: Any) -> datetime | None:
+    ts = pd.to_datetime(value, utc=True, errors="coerce")
+    if pd.isna(ts):
+        return None
+    return ts.to_pydatetime()
+
+
+def _compute_stoploss_mark_price(
+    *,
+    snapshot: dict[str, Any] | None,
+    now_utc: datetime,
+    max_snapshot_age_minutes: float,
+) -> tuple[float | None, str | None, datetime | None, float | None, str | None]:
+    if not snapshot:
+        return None, None, None, None, "no_snapshot"
+
+    no_bid = _as_float(snapshot.get("best_no_bid"))
+    no_ts = _parse_snapshot_ts(snapshot.get("no_snapshot_ts_utc"))
+    yes_ask = _as_float(snapshot.get("best_yes_ask"))
+    yes_ts = _parse_snapshot_ts(snapshot.get("yes_snapshot_ts_utc"))
+
+    mark_price: float | None = None
+    source: str | None = None
+    ts: datetime | None = None
+    if no_bid is not None:
+        mark_price = min(1.0, max(0.0, float(no_bid)))
+        source = "NO_bid"
+        ts = no_ts or yes_ts
+    elif yes_ask is not None:
+        mark_price = min(1.0, max(0.0, 1.0 - float(yes_ask)))
+        source = "YES_ask_fallback"
+        ts = yes_ts or no_ts
+
+    if mark_price is None or ts is None:
+        return None, source, ts, None, "no_market_price"
+
+    age_minutes = max(0.0, (now_utc - ts).total_seconds() / 60.0)
+    if age_minutes > float(max_snapshot_age_minutes):
+        return mark_price, source, ts, age_minutes, "snapshot_too_old"
+
+    return mark_price, source, ts, age_minutes, None
 
 
 def resolve_open_market_universe(
@@ -559,6 +708,7 @@ def resolve_open_market_universe(
                 "event_key": str(parsed["event_key"]).strip().lower(),
                 "strike_k": int(parsed["strike_k"]),
                 "market_day_local": market_day_local,
+                "resolution_time": getattr(row, "resolution_time", pd.NaT),
             }
         )
 
@@ -569,16 +719,38 @@ def resolve_open_market_universe(
         return out.iloc[0:0].copy(), unmapped
 
     market_idx = pd.DataFrame.from_records(market_rows)
-    market_idx = market_idx.sort_values(["market_id"], ascending=[False], kind="mergesort")
+    market_idx["market_id"] = market_idx["market_id"].map(_normalize_text)
+    market_idx["slug"] = market_idx["slug"].map(_normalize_text)
+    market_idx["slug_norm"] = market_idx["slug"].map(_normalize_slug)
+    market_idx["event_key"] = market_idx["event_key"].map(lambda v: _normalize_event_key(v))
+    market_idx["station_key"] = market_idx["station_key"].map(_normalize_text)
+    market_idx["market_day_local"] = market_idx["market_day_local"].map(_to_day_iso)
+    market_idx["strike_k"] = market_idx["strike_k"].map(_safe_int)
+    market_idx["resolution_time"] = pd.to_datetime(market_idx.get("resolution_time"), utc=True, errors="coerce")
+    market_idx["_market_id_sort"] = market_idx["market_id"].map(_market_id_sort_key)
+    market_idx = market_idx.dropna(subset=["market_day_local", "strike_k"]).copy()
+    market_idx = market_idx.sort_values(
+        ["station_key", "market_day_local", "event_key", "strike_k", "resolution_time", "_market_id_sort"],
+        ascending=[True, True, True, True, False, False],
+        kind="mergesort",
+    )
+
+    market_key_cols = ["station_key", "market_day_local", "event_key", "strike_k"]
+    duplicate_keys = int(market_idx.duplicated(subset=market_key_cols, keep="first").sum())
+    if duplicate_keys > 0:
+        logger.warning(
+            "Open market universe contains %d duplicate station/day/event/strike keys (deduped to canonical rows)",
+            duplicate_keys,
+        )
+        market_idx = market_idx.drop_duplicates(subset=market_key_cols, keep="first").copy()
 
     by_market_id: dict[str, dict[str, Any]] = {
         str(r.market_id): r._asdict() for r in market_idx.itertuples(index=False)
     }
     by_slug: dict[str, dict[str, Any]] = {
-        str(r.slug): r._asdict() for r in market_idx.itertuples(index=False)
+        str(r.slug_norm): r._asdict() for r in market_idx.itertuples(index=False)
     }
     by_key: dict[tuple[str, str, str, int], dict[str, Any]] = {}
-    duplicate_keys = 0
     for rec in market_idx.to_dict(orient="records"):
         key = (
             str(rec["station_key"]),
@@ -586,60 +758,99 @@ def resolve_open_market_universe(
             str(rec["event_key"]),
             int(rec["strike_k"]),
         )
-        if key in by_key:
-            duplicate_keys += 1
-            continue
         by_key[key] = rec
-    if duplicate_keys > 0:
-        logger.warning("Open market universe contains %d duplicate station/day/event/strike keys", duplicate_keys)
+
+    out = out.copy()
+    out["__station_key"] = out.get("station", "").map(lambda v: normalize_station_key(_normalize_text(v)))
+    out["__day_iso"] = out.get("market_day_local").map(_to_day_iso)
+    out["__strike_k"] = out.get("strike_k").map(_safe_int)
+    out["__raw_market_id"] = out.get("market_id").map(_normalize_text)
+    out["__raw_slug"] = out.get("slug").map(_normalize_text)
+    out["__raw_slug_norm"] = out["__raw_slug"].map(_normalize_slug)
+    out["__event_key_norm"] = out.apply(
+        lambda r: _normalize_event_key(r.get("event_key"), slug_fallback=r.get("__raw_slug")),
+        axis=1,
+    )
+    out["__has_valid_canonical_key"] = (
+        out["__station_key"].astype(bool)
+        & out["__day_iso"].notna()
+        & out["__event_key_norm"].astype(bool)
+        & out["__strike_k"].notna()
+    )
+    out["__market_id_open"] = out["__raw_market_id"].map(lambda v: bool(v) and v in by_market_id)
+    out["__slug_open"] = out["__raw_slug_norm"].map(lambda v: bool(v) and v in by_slug)
+    out = out.sort_values(
+        ["__has_valid_canonical_key", "__market_id_open", "__slug_open"],
+        ascending=[False, False, False],
+        kind="mergesort",
+    )
+    candidate_key_cols = ["__station_key", "__day_iso", "__event_key_norm", "__strike_k"]
+    candidate_dupe_mask = out["__has_valid_canonical_key"] & out.duplicated(subset=candidate_key_cols, keep="first")
+    candidate_dupe_count = int(candidate_dupe_mask.sum())
+    if candidate_dupe_count > 0:
+        logger.warning(
+            "Candidate universe contains %d duplicate station/day/event/strike keys (deduped before mapping)",
+            candidate_dupe_count,
+        )
+        out = out.loc[~candidate_dupe_mask].copy()
+
+    temp_cols = [
+        "__station_key",
+        "__day_iso",
+        "__strike_k",
+        "__raw_market_id",
+        "__raw_slug",
+        "__raw_slug_norm",
+        "__event_key_norm",
+        "__has_valid_canonical_key",
+        "__market_id_open",
+        "__slug_open",
+    ]
 
     mapped_records: list[dict[str, Any]] = []
     unmapped_records: list[dict[str, Any]] = []
-    for row in out.itertuples(index=False):
-        rec = row._asdict()
-        raw_market_id = None if pd.isna(rec.get("market_id")) else str(rec.get("market_id")).strip()
-        raw_slug = None if pd.isna(rec.get("slug")) else str(rec.get("slug")).strip()
-        station = str(rec.get("station") or "").strip()
-        station_key = normalize_station_key(station)
-        event_key_raw = None if pd.isna(rec.get("event_key")) else str(rec.get("event_key")).strip()
-        if not event_key_raw and raw_slug:
-            event_key_raw = _derive_event_key(raw_slug)
-        event_key = str(event_key_raw).strip().lower() if event_key_raw else ""
-
-        day_iso = _to_day_iso(rec.get("market_day_local"))
-        strike_k: int | None
-        try:
-            strike_k = int(rec.get("strike_k"))
-        except Exception:
-            strike_k = None
+    for rec in out.to_dict(orient="records"):
+        raw_market_id = _normalize_text(rec.get("__raw_market_id"))
+        raw_slug = _normalize_text(rec.get("__raw_slug"))
+        raw_slug_norm = _normalize_slug(rec.get("__raw_slug_norm"))
+        station_key = _normalize_text(rec.get("__station_key"))
+        day_iso = _normalize_text(rec.get("__day_iso"))
+        event_key = _normalize_event_key(rec.get("__event_key_norm"))
+        strike_k = _safe_int(rec.get("__strike_k"))
 
         mapped_market: dict[str, Any] | None = None
         fallback_reason: str | None = None
 
+        market_id_not_open = bool(raw_market_id) and raw_market_id not in by_market_id
+        slug_not_open = bool(raw_slug_norm) and raw_slug_norm not in by_slug
+
         if raw_market_id:
             mapped_market = by_market_id.get(raw_market_id)
-            if mapped_market is None:
-                fallback_reason = "market_id_not_open"
 
-        if mapped_market is None and raw_slug:
-            mapped_market = by_slug.get(raw_slug)
-            if mapped_market is None and fallback_reason is None:
-                fallback_reason = "slug_not_open"
+        if mapped_market is None and raw_slug_norm:
+            mapped_market = by_slug.get(raw_slug_norm)
 
         if mapped_market is None:
             if not station_key:
-                fallback_reason = fallback_reason or "missing_station"
+                fallback_reason = "missing_station"
             elif not day_iso:
-                fallback_reason = fallback_reason or "invalid_market_day_local"
+                fallback_reason = "invalid_market_day_local"
             elif strike_k is None:
-                fallback_reason = fallback_reason or "invalid_strike_k"
+                fallback_reason = "invalid_strike_k"
             elif not event_key:
-                fallback_reason = fallback_reason or "missing_event_key"
+                fallback_reason = "missing_event_key"
             else:
                 mapped_market = by_key.get((station_key, day_iso, event_key, strike_k))
-                if mapped_market is None and fallback_reason is None:
-                    fallback_reason = "no_station_day_strike_match"
+                if mapped_market is None:
+                    if market_id_not_open:
+                        fallback_reason = "market_id_not_open"
+                    elif slug_not_open:
+                        fallback_reason = "slug_not_open"
+                    else:
+                        fallback_reason = "no_station_day_strike_match"
 
+        for col in temp_cols:
+            rec.pop(col, None)
         if mapped_market is None:
             rec["unmapped_reason"] = fallback_reason or "unmapped"
             unmapped_records.append(rec)
@@ -654,6 +865,8 @@ def resolve_open_market_universe(
     if mapped.empty:
         mapped = out.iloc[0:0].copy()
     unmapped = pd.DataFrame.from_records(unmapped_records)
+    mapped = mapped.drop(columns=temp_cols, errors="ignore")
+    unmapped = unmapped.drop(columns=temp_cols, errors="ignore")
 
     if not unmapped.empty:
         counts = unmapped["unmapped_reason"].astype(str).value_counts().to_dict()
@@ -1024,6 +1237,8 @@ def _decision_reason_code(clean: dict[str, Any]) -> str:
         return reason if reason else "skip_unknown"
     if decision == "TRADE":
         return "trade_approved"
+    if decision == "SELL":
+        return str(clean.get("sell_reason") or "position_sold")
     if decision == "RESOLVE":
         return str(clean.get("resolution") or "position_resolved")
     return decision.lower() or "unknown"
@@ -1071,6 +1286,20 @@ def _build_decision_explanation(clean: dict[str, Any]) -> str:
         resolution = str(clean.get("resolution") or "resolved")
         return f"Position resolved: resolution={resolution} pnl={_fmt_num(pnl, digits=2)}"
 
+    if decision == "SELL":
+        pnl = _as_float(clean.get("pnl_realized"))
+        buy_price = _as_float(clean.get("buy_price"))
+        if buy_price is None:
+            buy_price = _as_float(clean.get("entry_price"))
+        sell_price = _as_float(clean.get("sell_price"))
+        if sell_price is None:
+            sell_price = _as_float(clean.get("exit_price"))
+        sell_reason = str(clean.get("sell_reason") or clean.get("resolution") or "position_sold")
+        return (
+            "Position sold: "
+            f"reason={sell_reason} buy={_fmt_num(buy_price)} sell={_fmt_num(sell_price)} pnl={_fmt_num(pnl, digits=2)}"
+        )
+
     if reason == "edge_too_low":
         return f"Skipped: edge below threshold (edge={_fmt_num(edge)} threshold={_fmt_num(edge_th)})."
     if reason == "p_model_too_high":
@@ -1108,11 +1337,13 @@ def _log_action(
     conn: psycopg.Connection | None,
     run_id: str,
     payload: dict[str, Any],
+    emit_info_log: bool = True,
 ) -> None:
     clean = _clean_for_json(payload)
     clean["decision_reason_code"] = _decision_reason_code(clean)
     clean["decision_explanation"] = _build_decision_explanation(clean)
-    logger.info(
+    log_method = logger.info if emit_info_log else logger.debug
+    log_method(
         "[%s] %s %s reason_code=%s edge=%s price=%s explain=%s",
         clean.get("station"),
         clean.get("decision"),
@@ -1138,6 +1369,15 @@ def _log_action(
             )
         except Exception:
             logger.exception("Failed to insert live action row into DB")
+
+
+def _should_emit_action_info_log(payload: Mapping[str, Any], cfg: Mapping[str, Any]) -> bool:
+    decision = str(payload.get("decision") or "").upper()
+    if decision in {"TRADE", "RESOLVE"}:
+        return True
+    if decision == "SKIP":
+        return bool(cfg.get("log_skip_decisions_at_info", False))
+    return True
 
 
 def _update_stoploss_and_kills(
@@ -1253,6 +1493,286 @@ def _settle_resolved_positions(
         _log_action(logger=logger, jsonl_path=jsonl_path, conn=conn, run_id=run_id, payload=payload)
         if notifier is not None:
             notifier.notify_trade(payload, logger=logger)
+
+
+def _apply_trade_stoplosses(
+    *,
+    cfg: Mapping[str, Any],
+    state_store: PilotStateStore,
+    conn: psycopg.Connection,
+    snapshot_info: dbmod.SnapshotTableInfo,
+    exec_client: Any,
+    dry_run: bool,
+    run_id: str,
+    logger: logging.Logger,
+    jsonl_path: Path | None,
+    notifier: TelegramNotifier | None,
+    now_utc: datetime,
+) -> None:
+    enabled, default_loss_fraction, default_break_even = _trade_stoploss_settings(cfg)
+    if not enabled:
+        return
+
+    open_positions = [p for p in state_store.open_positions() if str(p.get("status", "open")) == "open"]
+    if not open_positions:
+        return
+
+    market_ids = sorted({str(p.get("market_id")) for p in open_positions if p.get("market_id")})
+    if not market_ids:
+        return
+
+    snapshot_df = dbmod.fetch_latest_snapshots(
+        conn,
+        snapshot_table=snapshot_info,
+        market_ids=market_ids,
+        lookback_per_outcome=int(cfg.get("snapshot_quote_lookback_per_outcome", 12)),
+    )
+    snapshot_map = {
+        str(row.market_id): {
+            "yes_snapshot_ts_utc": row.yes_snapshot_ts_utc,
+            "no_snapshot_ts_utc": row.no_snapshot_ts_utc,
+            "best_yes_bid": row.best_yes_bid,
+            "best_yes_ask": row.best_yes_ask,
+            "best_no_bid": row.best_no_bid,
+            "best_no_ask": row.best_no_ask,
+            "yes_bid_size": row.yes_bid_size,
+            "yes_ask_size": row.yes_ask_size,
+            "no_bid_size": row.no_bid_size,
+            "no_ask_size": row.no_ask_size,
+        }
+        for row in snapshot_df.itertuples(index=False)
+    }
+
+    max_snapshot_age_minutes = float(cfg.get("max_snapshot_age_minutes", 30))
+    base_tz = str(cfg.get("timezones", {}).get("default", "UTC"))
+    day_key = today_local(base_tz, now_utc=now_utc).isoformat()
+
+    for pos in open_positions:
+        market_id = str(pos.get("market_id") or "").strip()
+        if not market_id:
+            continue
+
+        entry_price = _as_float(pos.get("entry_price"))
+        size = _as_float(pos.get("size"))
+        if entry_price is None or size is None or size <= POSITION_EPS:
+            continue
+
+        stoploss_enabled = bool(pos.get("stop_loss_enabled", enabled))
+        if not stoploss_enabled:
+            continue
+
+        loss_fraction = _as_float(pos.get("stop_loss_loss_fraction"))
+        if loss_fraction is None:
+            loss_fraction = default_loss_fraction
+        loss_fraction = min(0.99, max(0.0, float(loss_fraction)))
+
+        break_even_on_recovery = bool(pos.get("stop_loss_break_even_on_recovery", default_break_even))
+        break_even_armed = bool(pos.get("stop_loss_break_even_armed", False))
+
+        trigger_price = _as_float(pos.get("stop_loss_trigger_price"))
+        if trigger_price is None:
+            trigger_price = max(0.0, entry_price * (1.0 - loss_fraction))
+
+        snapshot = snapshot_map.get(market_id)
+        mark_price, mark_source, mark_ts, mark_age_minutes, mark_reason = _compute_stoploss_mark_price(
+            snapshot=snapshot,
+            now_utc=now_utc,
+            max_snapshot_age_minutes=max_snapshot_age_minutes,
+        )
+        if mark_price is None or mark_reason is not None:
+            logger.debug(
+                "Stop-loss mark unavailable position_id=%s market_id=%s reason=%s",
+                pos.get("position_id"),
+                market_id,
+                mark_reason or "unknown",
+            )
+            continue
+
+        if break_even_on_recovery and (not break_even_armed) and mark_price > (entry_price + POSITION_EPS):
+            break_even_armed = True
+            trigger_price = entry_price
+            logger.info(
+                "Stop-loss break-even armed position_id=%s market_id=%s entry=%.4f mark=%.4f",
+                pos.get("position_id"),
+                market_id,
+                entry_price,
+                mark_price,
+            )
+
+        if break_even_armed:
+            trigger_price = max(trigger_price, entry_price)
+
+        pos["stop_loss_enabled"] = stoploss_enabled
+        pos["stop_loss_loss_fraction"] = loss_fraction
+        pos["stop_loss_break_even_on_recovery"] = break_even_on_recovery
+        pos["stop_loss_break_even_armed"] = break_even_armed
+        pos["stop_loss_trigger_price"] = trigger_price
+        pos["stop_loss_last_mark_price"] = mark_price
+        pos["stop_loss_last_mark_source"] = mark_source
+        pos["stop_loss_last_mark_ts_utc"] = mark_ts.isoformat() if mark_ts is not None else None
+        pos["stop_loss_last_mark_age_minutes"] = mark_age_minutes
+
+        if mark_price > (trigger_price + POSITION_EPS):
+            continue
+
+        if dry_run:
+            logger.info(
+                "Stop-loss trigger (dry-run) position_id=%s market_id=%s mark=%.4f trigger=%.4f",
+                pos.get("position_id"),
+                market_id,
+                mark_price,
+                trigger_price,
+            )
+            continue
+
+        try:
+            order_id = exec_client.place_order(
+                market_id=market_id,
+                side="sell",
+                outcome="NO",
+                price=mark_price,
+                size=size,
+                metadata={
+                    "reason": "stop_loss",
+                    "trigger_price": trigger_price,
+                    "mark_source": mark_source,
+                    "mark_age_minutes": mark_age_minutes,
+                },
+            )
+        except Exception:
+            logger.exception(
+                "Stop-loss order placement failed position_id=%s market_id=%s",
+                pos.get("position_id"),
+                market_id,
+            )
+            continue
+
+        order_status = "submitted"
+        filled_size = float(size)
+        filled_price = float(mark_price)
+        if hasattr(exec_client, "execution_result"):
+            try:
+                res = exec_client.execution_result(order_id)
+            except Exception:
+                res = None
+            if res is not None:
+                order_status = str(res.order_status)
+                if res.filled_size is not None:
+                    filled_size = max(0.0, float(res.filled_size))
+                if res.filled_price is not None:
+                    filled_price = float(res.filled_price)
+
+        filled_size = min(size, filled_size)
+        if filled_size <= POSITION_EPS:
+            logger.warning(
+                "Stop-loss order not filled position_id=%s market_id=%s status=%s",
+                pos.get("position_id"),
+                market_id,
+                order_status,
+            )
+            continue
+
+        pnl = (filled_price - entry_price) * filled_size
+        state_store.add_realized_pnl(day_local=day_key, station=str(pos.get("station")), pnl=pnl)
+        state_store.set_nav_usd(state_store.nav_usd + pnl)
+
+        close_ts = utc_now()
+        remaining_size = max(0.0, size - filled_size)
+        if remaining_size <= POSITION_EPS:
+            state_store.close_position(
+                str(pos.get("position_id")),
+                close_ts_utc=close_ts,
+                pnl=pnl,
+                resolution="stop_loss",
+            )
+        else:
+            pos["size"] = remaining_size
+            pos["stake_usd"] = max(0.0, entry_price * remaining_size)
+
+        payload = {
+            "ts_utc": close_ts.isoformat(),
+            "station": pos.get("station"),
+            "market_day_local": pos.get("market_day_local"),
+            "market_id": market_id,
+            "slug": pos.get("slug"),
+            "asset_id": pos.get("asset_id"),
+            "strike_k": pos.get("strike_k"),
+            "mode_k": pos.get("mode_k"),
+            "p_model": pos.get("p_model"),
+            "entry_price": entry_price,
+            "buy_price": entry_price,
+            "sell_price": filled_price,
+            "exit_price": filled_price,
+            "chosen_no_ask": filled_price,
+            "size": filled_size,
+            "lot": filled_size,
+            "decision": "SELL",
+            "side": "SELL",
+            "sell_reason": "stop_loss",
+            "skipped_reason": "",
+            "order_side": "sell",
+            "order_outcome": "NO",
+            "order_id": order_id,
+            "order_status": order_status,
+            "pnl_realized": pnl,
+            "total_loss": abs(min(0.0, pnl)),
+            "stop_loss_trigger_price": trigger_price,
+            "stop_loss_break_even_armed": break_even_armed,
+            "mark_price": mark_price,
+            "mark_source": mark_source,
+            "mark_age_minutes": mark_age_minutes,
+            "position_id": pos.get("position_id"),
+        }
+        _log_action(logger=logger, jsonl_path=jsonl_path, conn=conn, run_id=run_id, payload=payload, emit_info_log=True)
+        if notifier is not None:
+            notifier.notify_trade(payload, logger=logger)
+
+
+def _run_open_position_maintenance(
+    *,
+    cfg: dict[str, Any],
+    state_store: PilotStateStore,
+    stations: list[str],
+    conn: psycopg.Connection,
+    snapshot_info: dbmod.SnapshotTableInfo,
+    exec_client: Any,
+    dry_run: bool,
+    run_id: str,
+    logger: logging.Logger,
+    jsonl_path: Path | None,
+    notifier: TelegramNotifier | None,
+    now_utc: datetime,
+) -> None:
+    _settle_resolved_positions(
+        conn=conn,
+        state_store=state_store,
+        run_id=run_id,
+        logger=logger,
+        jsonl_path=jsonl_path,
+        notifier=notifier,
+    )
+    _apply_trade_stoplosses(
+        cfg=cfg,
+        state_store=state_store,
+        conn=conn,
+        snapshot_info=snapshot_info,
+        exec_client=exec_client,
+        dry_run=dry_run,
+        run_id=run_id,
+        logger=logger,
+        jsonl_path=jsonl_path,
+        notifier=notifier,
+        now_utc=now_utc,
+    )
+    base_tz = str(cfg.get("timezones", {}).get("default", "UTC"))
+    local_day = today_local(base_tz, now_utc=now_utc)
+    _update_stoploss_and_kills(
+        cfg=cfg,
+        state_store=state_store,
+        stations=stations,
+        day_local=local_day,
+        logger=logger,
+    )
 
 
 def _should_emit_daily_report(*, cfg: dict[str, Any], state_store: PilotStateStore, now_local: datetime) -> bool:
@@ -1557,10 +2077,25 @@ def run_cycle(
 
     stations = [str(s).strip() for s in cfg.get("stations_allowlist", []) if str(s).strip()]
     station_tz = build_station_timezone_map(cfg, stations)
+    exec_client = _build_execution_client(cfg)
 
     universe = select_live_universe(prob=prob, cfg=cfg, station_tz=station_tz, now_utc=now)
     if universe.empty:
         logger.info("No probability rows in live universe after station/date/cutoff filters")
+        _run_open_position_maintenance(
+            cfg=cfg,
+            state_store=state_store,
+            stations=stations,
+            conn=conn,
+            snapshot_info=snapshot_info,
+            exec_client=exec_client,
+            dry_run=dry_run,
+            run_id=run_id,
+            logger=logger,
+            jsonl_path=jsonl_path,
+            notifier=notifier,
+            now_utc=now,
+        )
         return
 
     universe, _unmapped = resolve_open_market_universe(
@@ -1572,10 +2107,29 @@ def run_cycle(
     )
     if universe.empty:
         logger.info("No mapped rows in open-market universe after resolver")
+        _run_open_position_maintenance(
+            cfg=cfg,
+            state_store=state_store,
+            stations=stations,
+            conn=conn,
+            snapshot_info=snapshot_info,
+            exec_client=exec_client,
+            dry_run=dry_run,
+            run_id=run_id,
+            logger=logger,
+            jsonl_path=jsonl_path,
+            notifier=notifier,
+            now_utc=now,
+        )
         return
 
     market_ids = sorted(universe["market_id"].dropna().astype(str).unique().tolist())
-    snapshot_df = dbmod.fetch_latest_snapshots(conn, snapshot_table=snapshot_info, market_ids=market_ids)
+    snapshot_df = dbmod.fetch_latest_snapshots(
+        conn,
+        snapshot_table=snapshot_info,
+        market_ids=market_ids,
+        lookback_per_outcome=int(cfg.get("snapshot_quote_lookback_per_outcome", 12)),
+    )
     snapshot_map = {
         str(row.market_id): {
             "yes_snapshot_ts_utc": row.yes_snapshot_ts_utc,
@@ -1710,6 +2264,20 @@ def run_cycle(
     candidates = pd.DataFrame.from_records(records)
     if candidates.empty:
         logger.info("No candidates generated")
+        _run_open_position_maintenance(
+            cfg=cfg,
+            state_store=state_store,
+            stations=stations,
+            conn=conn,
+            snapshot_info=snapshot_info,
+            exec_client=exec_client,
+            dry_run=dry_run,
+            run_id=run_id,
+            logger=logger,
+            jsonl_path=jsonl_path,
+            notifier=notifier,
+            now_utc=now,
+        )
         return
 
     candidates = attach_progression_features(state_store.state, candidates)
@@ -1799,23 +2367,8 @@ def run_cycle(
             station_timezones=station_tz,
         )
 
-    mode = str(cfg.get("mode", "paper")).lower()
-    if mode == "paper":
-        exec_client: Any = DummyExecutionClient(
-            price_tick=float(cfg.get("price_tick", 0.001)),
-            conservative_fill=True,
-            realism_enabled=bool(cfg.get("paper_execution_realism", True)),
-            deterministic_seed=int(cfg.get("paper_execution_random_seed", 0)),
-            fill_probability_base=float(cfg.get("paper_fill_probability_base", 0.9)),
-            partial_fill_probability=float(cfg.get("paper_partial_fill_probability", 0.2)),
-            max_slippage_ticks=int(cfg.get("paper_max_slippage_ticks", 3)),
-        )
-    elif mode == "live":
-        exec_client = RealExecutionClient()
-    else:
-        raise SystemExit(f"Invalid mode: {mode}")
-
     csv_trades_rows: list[dict[str, Any]] = []
+    trade_stoploss_enabled, trade_stoploss_loss_fraction, trade_stoploss_break_even = _trade_stoploss_settings(cfg)
     trade_cooldown_minutes = max(0.0, float(cfg.get("trade_cooldown_minutes", 30)))
     state_store.prune_recent_order_keys(retention_hours=ORDER_KEY_RETENTION_HOURS, now_utc=now)
     state_store.prune_trade_cooldowns(cooldown_minutes=trade_cooldown_minutes, now_utc=now)
@@ -1828,6 +2381,8 @@ def run_cycle(
         cooldown_minutes=trade_cooldown_minutes,
         now_utc=now,
     )
+    decision_counts: Counter[str] = Counter()
+    skip_reason_counts: Counter[str] = Counter()
 
     for row in policy_out.itertuples(index=False):
         payload = row._asdict()
@@ -1914,6 +2469,7 @@ def run_cycle(
                             conn,
                             snapshot_table=snapshot_info,
                             market_ids=[market_id],
+                            lookback_per_outcome=int(cfg.get("snapshot_quote_lookback_per_outcome", 12)),
                         )
                         refreshed_snapshot = None
                         if not refreshed_snapshot_df.empty:
@@ -2056,6 +2612,8 @@ def run_cycle(
                             payload["size"] = filled_size
                             payload["stake_usd"] = float(payload["chosen_no_ask"]) * float(filled_size)
                             state_store.add_trade(day_local=day_key, station=station, risk_used=float(payload.get("stake_usd") or 0.0))
+                            entry_price = float(payload["chosen_no_ask"])
+                            stop_loss_trigger_price = max(0.0, entry_price * (1.0 - trade_stoploss_loss_fraction))
 
                             pos_id = state_store.add_open_position(
                                 {
@@ -2073,6 +2631,11 @@ def run_cycle(
                                     "edge_at_entry": payload.get("edge_after_price_check"),
                                     "price_source": payload.get("price_source"),
                                     "order_key": payload.get("order_key"),
+                                    "stop_loss_enabled": trade_stoploss_enabled,
+                                    "stop_loss_loss_fraction": trade_stoploss_loss_fraction,
+                                    "stop_loss_break_even_on_recovery": trade_stoploss_break_even,
+                                    "stop_loss_break_even_armed": False,
+                                    "stop_loss_trigger_price": stop_loss_trigger_price,
                                 }
                             )
                             payload["position_id"] = pos_id
@@ -2100,34 +2663,60 @@ def run_cycle(
         else:
             state_store.add_skip(day_local=str(payload["market_day_local"]), station=str(payload["station"]))
 
-        _log_action(logger=logger, jsonl_path=jsonl_path, conn=conn, run_id=run_id, payload=payload)
+        decision_label = str(payload.get("decision") or "UNKNOWN").upper()
+        decision_counts[decision_label] += 1
+        if decision_label == "SKIP":
+            reason = str(payload.get("skipped_reason") or "").strip() or "unspecified"
+            skip_reason_counts[reason] += 1
+
+        _log_action(
+            logger=logger,
+            jsonl_path=jsonl_path,
+            conn=conn,
+            run_id=run_id,
+            payload=payload,
+            emit_info_log=_should_emit_action_info_log(payload, cfg),
+        )
         if payload.get("decision") == "TRADE" and notifier is not None:
             notifier.notify_trade(payload, logger=logger)
         csv_trades_rows.append(payload)
 
-    _settle_resolved_positions(
-        conn=conn,
+    if bool(cfg.get("log_cycle_decision_summary", True)) and decision_counts:
+        top_n = max(0, int(cfg.get("log_cycle_summary_top_skip_reasons", 6)))
+        if top_n > 0 and skip_reason_counts:
+            top_skip = ", ".join(
+                f"{reason}:{count}" for reason, count in skip_reason_counts.most_common(top_n)
+            )
+        else:
+            top_skip = "none"
+        logger.info(
+            "Cycle decision summary total=%d trades=%d skips=%d top_skip_reasons=%s",
+            sum(decision_counts.values()),
+            int(decision_counts.get("TRADE", 0)),
+            int(decision_counts.get("SKIP", 0)),
+            top_skip,
+        )
+
+    _run_open_position_maintenance(
+        cfg=cfg,
         state_store=state_store,
+        stations=stations,
+        conn=conn,
+        snapshot_info=snapshot_info,
+        exec_client=exec_client,
+        dry_run=dry_run,
         run_id=run_id,
         logger=logger,
         jsonl_path=jsonl_path,
         notifier=notifier,
-    )
-
-    base_tz = str(cfg.get("timezones", {}).get("default", "UTC"))
-    local_day = today_local(base_tz, now_utc=now)
-    _update_stoploss_and_kills(
-        cfg=cfg,
-        state_store=state_store,
-        stations=stations,
-        day_local=local_day,
-        logger=logger,
+        now_utc=now,
     )
 
     if bool(cfg.get("write_csv_trades", True)) and csv_trades_rows:
         csv_path = output_dir / "logs" / f"trades_{to_yyyymmdd(now.date())}.csv"
         pd.DataFrame(csv_trades_rows).to_csv(csv_path, index=False)
 
+    base_tz = str(cfg.get("timezones", {}).get("default", "UTC"))
     local_now = now.astimezone(ZoneInfo(base_tz))
     if _should_emit_daily_report(cfg=cfg, state_store=state_store, now_local=local_now):
         report = generate_daily_report(
@@ -2170,8 +2759,19 @@ def main(argv: list[str] | None = None) -> int:
 
     run_id = f"run_{uuid.uuid4().hex[:12]}"
     today_utc = utc_now().date()
-    log_path = output_dir / "logs" / f"live_pilot_{to_yyyymmdd(today_utc)}.log"
-    logger = setup_logger(log_path, str(cfg.get("log_level", "INFO")))
+    explicit_log_path = str(cfg.get("log_file", "") or "").strip()
+    if explicit_log_path:
+        log_path = resolve_path(explicit_log_path)
+    else:
+        log_path = output_dir / "logs" / f"live_pilot_{to_yyyymmdd(today_utc)}.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    logger = setup_logger(
+        log_path,
+        str(cfg.get("log_level", "INFO")),
+        rotate_max_mb=int(cfg.get("log_rotate_max_mb", 128)),
+        rotate_backups=int(cfg.get("log_rotate_backups", 20)),
+        to_stdout=bool(cfg.get("log_to_stdout", True)),
+    )
 
     logger.info("Starting live pilot run_id=%s mode=%s dry_run=%s", run_id, cfg.get("mode"), args.dry_run)
 

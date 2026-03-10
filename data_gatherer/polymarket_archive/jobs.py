@@ -117,6 +117,7 @@ async def run_live_once(settings: Settings, db: Database, run_id: str | None = N
 async def run_live_loop(settings: Settings, db: Database) -> None:
     run_id = str(uuid4())
     last_discovery: datetime | None = None
+    last_snapshot_compaction: datetime | None = None
     logger = logging.getLogger(__name__)
     async with httpx.AsyncClient(timeout=httpx.Timeout(settings.request_timeout_seconds)) as client:
         limiter = RequestLimiter(settings.rate_limit_per_second)
@@ -210,6 +211,27 @@ async def run_live_loop(settings: Settings, db: Database) -> None:
                     else:
                         _start_rest()
 
+            if bool(settings.snapshot_compaction_enabled):
+                if (
+                    last_snapshot_compaction is None
+                    or (now - last_snapshot_compaction).total_seconds() >= settings.snapshot_compaction_interval_seconds
+                ):
+                    compaction_stats = await db.compact_resolved_book_snapshots(
+                        as_of=now,
+                        grace_minutes=settings.snapshot_compaction_grace_minutes,
+                        bucket_seconds_recent=settings.resolved_compaction_bucket_seconds_recent,
+                        bucket_seconds_mid=settings.resolved_compaction_bucket_seconds_mid,
+                        bucket_seconds_old=settings.resolved_compaction_bucket_seconds_old,
+                    )
+                    last_snapshot_compaction = now
+                    if compaction_stats.get("rows_deleted", 0) > 0:
+                        logger.info(
+                            "Snapshot compaction completed buckets=%d updated=%d deleted=%d",
+                            int(compaction_stats.get("buckets_compacted", 0)),
+                            int(compaction_stats.get("rows_updated", 0)),
+                            int(compaction_stats.get("rows_deleted", 0)),
+                        )
+
             market_ids = await db.list_market_condition_ids()
             await _ingest_trades_for_market_ids(
                 db,
@@ -273,12 +295,29 @@ async def _refresh_clob_token_map(
 ) -> None:
     latest = await _build_clob_token_map(db)
     added = 0
+    removed = 0
+    remapped = 0
+    stale_token_ids = [token_id for token_id in token_map if token_id not in latest]
+    for token_id in stale_token_ids:
+        token_map.pop(token_id, None)
+        removed += 1
     for token_id, mapping in latest.items():
-        if token_id not in token_map:
+        current = token_map.get(token_id)
+        if current is None:
             token_map[token_id] = mapping
             added += 1
-    if added:
-        logger.info("Added %d new CLOB token ids", added)
+            continue
+        if current != mapping:
+            token_map[token_id] = mapping
+            remapped += 1
+    if added or removed or remapped:
+        logger.info(
+            "Refreshed CLOB token ids total=%d added=%d removed=%d remapped=%d",
+            len(token_map),
+            added,
+            removed,
+            remapped,
+        )
 
 
 async def _ingest_trades_concurrently(

@@ -154,8 +154,13 @@ body {
   height: clamp(195px, 21vw, 250px);
 }
 
-.resolved-market-row {
+.resolved-market-rows {
   margin-top: 6px;
+  display: grid;
+  row-gap: 3px;
+}
+
+.resolved-market-row {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
   align-items: center;

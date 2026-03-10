@@ -33,6 +33,7 @@ CREATE TABLE IF NOT EXISTS markets (
 
 CREATE INDEX IF NOT EXISTS markets_updated_at_idx ON markets(updated_at);
 CREATE INDEX IF NOT EXISTS markets_status_idx ON markets(status);
+CREATE INDEX IF NOT EXISTS markets_status_resolution_idx ON markets(status, resolution_time);
 
 CREATE TABLE IF NOT EXISTS outcomes (
     market_id TEXT NOT NULL REFERENCES markets(market_id) ON DELETE CASCADE,
@@ -77,3 +78,6 @@ CREATE TABLE IF NOT EXISTS book_snapshots (
     raw JSONB NOT NULL,
     PRIMARY KEY (market_id, ts, outcome_index)
 );
+CREATE INDEX IF NOT EXISTS book_snapshots_market_outcome_ts_idx
+    ON book_snapshots(market_id, outcome_index, ts DESC);
+CREATE INDEX IF NOT EXISTS book_snapshots_ts_idx ON book_snapshots(ts DESC);

@@ -66,6 +66,7 @@ class PanelDataService:
         self.parquet_read_workers = max(1, int(parquet_read_workers))
 
         self.station_meta = self._load_station_meta(locations_csv)
+        self.source_to_station = self._build_source_to_station()
         self.file_index = self._build_file_index(model_specs)
         self.stations = self._discover_common_stations()
         self.history_days = self._infer_history_days(default_history_days)
@@ -117,6 +118,7 @@ class PanelDataService:
             station_meta_lookup=station_meta_lookup,
         )
         parquet_reads_ms = (time.perf_counter() - parquet_started) * 1000.0
+        active_no_markets = self._load_active_no_markets_for_day(day)
 
         stations_payload: list[dict[str, Any]] = []
         for station in self.stations:
@@ -151,10 +153,14 @@ class PanelDataService:
                     }
                 )
 
-            resolved_market = self.resolved_yes_markets.get(
-                (station, day),
-                {"left": "Max. Temp.: N/A", "right": ""},
+            market_rows = self._build_market_rows_for_station_day(
+                station=station,
+                day=day,
+                now_utc=now_utc,
+                meta=meta,
+                active_no_markets=active_no_markets,
             )
+            primary_market_row = market_rows[0]
 
             stations_payload.append(
                 {
@@ -162,8 +168,9 @@ class PanelDataService:
                     "unit": unit,
                     "current_local_time": current_local_time,
                     "last_observation": last_observation,
-                    "resolved_yes_market_left": resolved_market["left"],
-                    "resolved_yes_market_right": resolved_market["right"],
+                    "resolved_yes_market_left": primary_market_row["left"],
+                    "resolved_yes_market_right": primary_market_row["right"],
+                    "market_rows": market_rows,
                     "reference_lines": reference_lines,
                     "traces": traces,
                 }
@@ -564,11 +571,7 @@ class PanelDataService:
         return float(value)
 
     def _load_resolved_yes_markets(self) -> dict[tuple[str, dt.date], dict[str, str]]:
-        source_to_station = {
-            meta.resolution_source_key: station
-            for station, meta in self.station_meta.items()
-            if meta.resolution_source_key
-        }
+        source_to_station = self.source_to_station
         if not source_to_station:
             return {}
 
@@ -627,6 +630,97 @@ class PanelDataService:
 
         return {k: v[1] for k, v in selected.items()}
 
+    def _build_market_rows_for_station_day(
+        self,
+        *,
+        station: str,
+        day: dt.date,
+        now_utc: dt.datetime,
+        meta: StationMeta,
+        active_no_markets: dict[str, list[dict[str, str]]],
+    ) -> list[dict[str, str]]:
+        station_today = now_utc.astimezone(self._get_zone(meta.timezone)).date()
+        active_rows = active_no_markets.get(station, [])
+        resolved_row = self.resolved_yes_markets.get((station, day))
+
+        if day >= station_today:
+            chosen_rows = active_rows
+        else:
+            chosen_rows = [resolved_row] if resolved_row is not None else active_rows
+
+        if chosen_rows:
+            return chosen_rows
+        return [{"left": "Max. Temp.: N/A", "right": ""}]
+
+    def _load_active_no_markets_for_day(self, day: dt.date) -> dict[str, list[dict[str, str]]]:
+        if not self.source_to_station:
+            return {}
+
+        query = (
+            "SELECT title, raw, updated_at, resolution_time "
+            "FROM markets "
+            "WHERE status = 'active' "
+            "AND lower(title) LIKE '%highest temperature%'"
+        )
+
+        # Deduplicate by parsed market summary and keep the freshest price timestamp per station.
+        selected: dict[str, dict[str, tuple[pd.Timestamp, dict[str, str]]]] = {}
+        with psycopg.connect(self.master_dsn) as conn:
+            with conn.cursor() as cur:
+                cur.execute(query)
+                rows = cur.fetchall()
+
+        for title, raw, updated_at, resolution_time in rows:
+            raw_dict = self._coerce_raw_json(raw)
+            if not raw_dict:
+                continue
+
+            source_key = self._normalize_source_url(raw_dict.get("resolutionSource"))
+            station = self.source_to_station.get(source_key)
+            if station is None:
+                continue
+
+            target_day = self._extract_market_day(title=title, raw=raw_dict, resolution_time=resolution_time)
+            if target_day != day:
+                continue
+
+            summary = self._format_resolved_market_summary(title)
+            if summary is None:
+                continue
+
+            no_price = self._extract_no_price(raw_dict)
+            if no_price is None:
+                continue
+
+            market_ts = self._extract_market_price_timestamp(raw=raw_dict, updated_at=updated_at)
+            station_zone = self._get_zone(self.station_meta[station].timezone)
+            if pd.isna(market_ts):
+                right_text = f"Price {self._format_price_cents(no_price)}"
+                sort_ts = pd.Timestamp("1970-01-01T00:00:00Z")
+            else:
+                local_ts = market_ts.tz_convert(station_zone).strftime("%Y-%m-%d %H:%M:%S")
+                right_text = f"Price {self._format_price_cents(no_price)} at {local_ts}"
+                sort_ts = market_ts
+
+            row = {"left": summary, "right": right_text}
+            station_rows = selected.setdefault(station, {})
+            existing = station_rows.get(summary)
+            if existing is None or sort_ts > existing[0]:
+                station_rows[summary] = (sort_ts, row)
+
+        out: dict[str, list[dict[str, str]]] = {}
+        for station, rows_by_summary in selected.items():
+            sorted_rows = sorted(rows_by_summary.values(), key=lambda item: item[1]["left"])
+            out[station] = [row for _, row in sorted_rows]
+        return out
+
+    def _build_source_to_station(self) -> dict[str, str]:
+        return {
+            meta.resolution_source_key: station
+            for station, meta in self.station_meta.items()
+            if meta.resolution_source_key
+        }
+
     @staticmethod
     def _coerce_raw_json(raw: Any) -> dict[str, Any]:
         if isinstance(raw, dict):
@@ -663,6 +757,53 @@ class PanelDataService:
             if isinstance(parsed, list):
                 return parsed
         return []
+
+    @classmethod
+    def _extract_no_price(cls, raw: dict[str, Any]) -> float | None:
+        prices = cls._normalize_json_list(raw.get("outcomePrices"))
+        if not prices:
+            return None
+
+        outcomes = cls._normalize_json_list(raw.get("outcomes"))
+        no_index = None
+        for idx, label in enumerate(outcomes):
+            if str(label).strip().lower() == "no":
+                no_index = idx
+                break
+
+        if no_index is None:
+            if len(prices) >= 2:
+                no_index = 1
+            else:
+                return None
+
+        if no_index >= len(prices):
+            return None
+
+        try:
+            no_price = float(prices[no_index])
+        except (TypeError, ValueError):
+            return None
+
+        if no_price < 0.0 or no_price > 1.0:
+            return None
+        return no_price
+
+    @staticmethod
+    def _extract_market_price_timestamp(*, raw: dict[str, Any], updated_at: Any) -> pd.Timestamp:
+        for key in ("updatedAt", "updated_at", "lastUpdated", "timestamp"):
+            value = raw.get(key)
+            if value is None:
+                continue
+            ts = pd.to_datetime(value, utc=True, errors="coerce")
+            if not pd.isna(ts):
+                return ts
+        return pd.to_datetime(updated_at, utc=True, errors="coerce")
+
+    @staticmethod
+    def _format_price_cents(price: float) -> str:
+        cents = max(0, min(100, int(round(float(price) * 100.0))))
+        return f"{cents}\N{CENT SIGN}"
 
     @classmethod
     def _is_yes_resolved(cls, raw: dict[str, Any]) -> bool:

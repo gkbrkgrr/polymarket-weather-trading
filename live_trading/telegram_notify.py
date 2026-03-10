@@ -182,8 +182,16 @@ def format_trade_message(record: dict[str, Any]) -> str | None:
         buy_price = _pick_first_number(record, ["buy_price", "entry_price", "avg_entry_price"])
         sell_price = _pick_first_number(record, ["sell_price", "chosen_no_ask", "price", "exit_price"])
         pnl = _pick_first_number(record, ["pnl_realized", "pnl"])
+        sell_reason = str(record.get("sell_reason") or "").strip().lower()
         if pnl is None and buy_price is not None and sell_price is not None and lot is not None:
             pnl = (sell_price - buy_price) * lot
+
+        if sell_reason in {"stop_loss", "stoploss"}:
+            return (
+                f"\N{LARGE RED CIRCLE} Market: {market} | Stop Loss | "
+                f"Buy Price: {_format_float(buy_price)} | Sell Price: {_format_float(sell_price)} | "
+                f"Lot: {_format_float(lot, ndigits=2)} | Total Loss: {_format_money(pnl)}"
+            )
 
         if pnl is None or pnl >= 0:
             return (

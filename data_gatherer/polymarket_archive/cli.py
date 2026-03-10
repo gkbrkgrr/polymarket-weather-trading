@@ -39,6 +39,8 @@ def main() -> None:
 
     subparsers.add_parser("run-live")
     subparsers.add_parser("run")
+    compact = subparsers.add_parser("compact-snapshots")
+    compact.add_argument("--as-of", default="now")
 
     subparsers.add_parser("test")
 
@@ -52,7 +54,14 @@ def main() -> None:
         raise SystemExit(subprocess.call(["pytest", "-q"]))
 
     settings = load_settings(args.config_path)
-    configure_logging(settings.log_level)
+    configure_logging(
+        settings.log_level,
+        log_file=settings.log_file,
+        log_to_stdout=settings.log_to_stdout,
+        log_rotate_max_mb=settings.log_rotate_max_mb,
+        log_rotate_backups=settings.log_rotate_backups,
+        log_http_requests=settings.log_http_requests,
+    )
 
     db = Database(settings.postgres_dsn)
 
@@ -74,6 +83,11 @@ def main() -> None:
         start_ts = settings.backfill_start
         end_ts = datetime.now(timezone.utc)
         asyncio.run(_run_full(db, settings, start_ts, end_ts))
+        return
+
+    if args.command == "compact-snapshots":
+        as_of = _parse_time(args.as_of) if args.as_of != "now" else datetime.now(timezone.utc)
+        asyncio.run(_compact_snapshots(db, settings, as_of))
         return
 
     if args.command == "export-parquet":
@@ -123,6 +137,24 @@ def _run_full(db: Database, settings, start_ts, end_ts) -> asyncio.Future:
             await db.ensure_schema(_schema_path())
             await run_backfill(settings, db, start_ts, end_ts)
             await run_live_loop(settings, db)
+        finally:
+            await db.close()
+
+    return _inner()
+
+
+def _compact_snapshots(db: Database, settings, as_of: datetime) -> asyncio.Future:
+    async def _inner() -> None:
+        await db.open()
+        try:
+            await db.ensure_schema(_schema_path())
+            await db.compact_resolved_book_snapshots(
+                as_of=as_of,
+                grace_minutes=settings.snapshot_compaction_grace_minutes,
+                bucket_seconds_recent=settings.resolved_compaction_bucket_seconds_recent,
+                bucket_seconds_mid=settings.resolved_compaction_bucket_seconds_mid,
+                bucket_seconds_old=settings.resolved_compaction_bucket_seconds_old,
+            )
         finally:
             await db.close()
 

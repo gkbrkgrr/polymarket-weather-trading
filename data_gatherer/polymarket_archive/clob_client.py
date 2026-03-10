@@ -141,7 +141,14 @@ class ClobClient:
             best_ask=best_ask,
             bid_size=bid_size,
             ask_size=ask_size,
-            raw=message,
+            raw=_build_snapshot_raw_metadata(
+                payload=message,
+                source="clob_ws",
+                token_id=token_id,
+                market_id=market_id,
+                outcome_index=outcome_index,
+                event_ts=ts,
+            ),
         )
         self._last_snapshot[key] = ts
         self._last_quote[key] = current_quote
@@ -344,7 +351,14 @@ class ClobRestClient:
                     best_ask=best_ask,
                     bid_size=bid_size,
                     ask_size=ask_size,
-                    raw=payload,
+                    raw=_build_snapshot_raw_metadata(
+                        payload=payload,
+                        source="clob_rest",
+                        token_id=token_id,
+                        market_id=market_id,
+                        outcome_index=snap_outcome,
+                        event_ts=ts,
+                    ),
                 )
                 self._last_snapshot[key] = ts
                 self._last_quote[key] = current_quote
@@ -355,3 +369,33 @@ class ClobRestClient:
         ]
         if tasks:
             await asyncio.gather(*tasks)
+
+
+def _build_snapshot_raw_metadata(
+    *,
+    payload: dict[str, Any] | None,
+    source: str,
+    token_id: str | None,
+    market_id: str,
+    outcome_index: int | None,
+    event_ts: datetime,
+) -> dict[str, Any]:
+    msg = payload if isinstance(payload, dict) else {}
+    data = msg.get("data") if isinstance(msg.get("data"), dict) else {}
+    bid_levels = data.get("bids") if isinstance(data.get("bids"), list) else []
+    ask_levels = data.get("asks") if isinstance(data.get("asks"), list) else []
+    ts_raw = data.get("timestamp") or data.get("ts") or data.get("time") or msg.get("timestamp")
+    msg_type = msg.get("type") or data.get("type") or msg.get("event_type")
+    return {
+        "v": 1,
+        "kind": "book_snapshot_meta",
+        "source": str(source),
+        "token_id": str(token_id) if token_id is not None else None,
+        "market_id": str(market_id),
+        "outcome_index": outcome_index,
+        "event_ts": event_ts.isoformat(),
+        "message_ts": str(ts_raw) if ts_raw is not None else None,
+        "message_type": str(msg_type) if msg_type is not None else None,
+        "bid_levels": len(bid_levels),
+        "ask_levels": len(ask_levels),
+    }

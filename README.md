@@ -50,6 +50,12 @@ Supported environment variables:
 - `DISCOVERY_INTERVAL_SECONDS` (default `300`)
 - `CONCURRENCY` (default `10`)
 - `BOOK_SNAPSHOT_INTERVAL_SECONDS` (default `5`)
+- `SNAPSHOT_COMPACTION_ENABLED` (default `true`)
+- `SNAPSHOT_COMPACTION_INTERVAL_SECONDS` (default `300`)
+- `SNAPSHOT_COMPACTION_GRACE_MINUTES` (default `60`)
+- `RESOLVED_COMPACTION_BUCKET_SECONDS_RECENT` (default `20`)
+- `RESOLVED_COMPACTION_BUCKET_SECONDS_MID` (default `30`)
+- `RESOLVED_COMPACTION_BUCKET_SECONDS_OLD` (default `60`)
 - `RAW_DIR` (default `./data/raw`)
 - `FEATURE_CLOB` (default `false`)
 
@@ -67,6 +73,12 @@ poll_interval_seconds: 30
 discovery_interval_seconds: 300
 concurrency: 10
 book_snapshot_interval_seconds: 5
+snapshot_compaction_enabled: true
+snapshot_compaction_interval_seconds: 300
+snapshot_compaction_grace_minutes: 60
+resolved_compaction_bucket_seconds_recent: 20
+resolved_compaction_bucket_seconds_mid: 30
+resolved_compaction_bucket_seconds_old: 60
 raw_dir: ./data/raw
 feature_clob: false
 ```
@@ -86,6 +98,11 @@ polymarket_archive backfill --start 2026-01-01T00:00:00Z --end now
 Live mode only:
 ```bash
 polymarket_archive run-live
+```
+
+Compact resolved-market snapshots once:
+```bash
+polymarket_archive compact-snapshots --as-of now
 ```
 
 Enable CLOB top-of-book snapshots (optional, requires `websockets`):

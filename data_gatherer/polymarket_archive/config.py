@@ -39,7 +39,18 @@ class Settings(BaseModel):
     book_snapshot_interval_seconds: int = 5
     rate_limit_per_second: int = 10
     log_level: str = "INFO"
+    log_file: Path | None = None
+    log_to_stdout: bool = True
+    log_rotate_max_mb: int = 128
+    log_rotate_backups: int = 20
+    log_http_requests: bool = False
     snapshot_interval_seconds: int | None = None
+    snapshot_compaction_enabled: bool = True
+    snapshot_compaction_interval_seconds: int = 300
+    snapshot_compaction_grace_minutes: int = 60
+    resolved_compaction_bucket_seconds_recent: int = 20
+    resolved_compaction_bucket_seconds_mid: int = 30
+    resolved_compaction_bucket_seconds_old: int = 60
 
 
 def _load_file(path: Path) -> dict[str, Any]:
@@ -171,7 +182,18 @@ def load_settings(config_path: str | Path | None = None) -> Settings:
         "book_snapshot_interval_seconds": data.get("book_snapshot_interval_seconds"),
         "rate_limit_per_second": data.get("rate_limit_per_second"),
         "log_level": data.get("log_level"),
+        "log_file": data.get("log_file"),
+        "log_to_stdout": data.get("log_to_stdout"),
+        "log_rotate_max_mb": data.get("log_rotate_max_mb"),
+        "log_rotate_backups": data.get("log_rotate_backups"),
+        "log_http_requests": data.get("log_http_requests"),
         "snapshot_interval_seconds": data.get("snapshot_interval_seconds"),
+        "snapshot_compaction_enabled": data.get("snapshot_compaction_enabled"),
+        "snapshot_compaction_interval_seconds": data.get("snapshot_compaction_interval_seconds"),
+        "snapshot_compaction_grace_minutes": data.get("snapshot_compaction_grace_minutes"),
+        "resolved_compaction_bucket_seconds_recent": data.get("resolved_compaction_bucket_seconds_recent"),
+        "resolved_compaction_bucket_seconds_mid": data.get("resolved_compaction_bucket_seconds_mid"),
+        "resolved_compaction_bucket_seconds_old": data.get("resolved_compaction_bucket_seconds_old"),
     }
     file_overrides = {key: value for key, value in file_overrides.items() if value is not None}
 
@@ -225,15 +247,45 @@ def load_settings(config_path: str | Path | None = None) -> Settings:
         env_overrides["rate_limit_per_second"] = env.get("RATE_LIMIT_PER_SECOND")
     if env.get("LOG_LEVEL"):
         env_overrides["log_level"] = env.get("LOG_LEVEL")
+    if env.get("LOG_FILE"):
+        env_overrides["log_file"] = env.get("LOG_FILE")
+    if env.get("LOG_TO_STDOUT"):
+        env_overrides["log_to_stdout"] = env.get("LOG_TO_STDOUT")
+    if env.get("LOG_ROTATE_MAX_MB"):
+        env_overrides["log_rotate_max_mb"] = env.get("LOG_ROTATE_MAX_MB")
+    if env.get("LOG_ROTATE_BACKUPS"):
+        env_overrides["log_rotate_backups"] = env.get("LOG_ROTATE_BACKUPS")
+    if env.get("LOG_HTTP_REQUESTS"):
+        env_overrides["log_http_requests"] = env.get("LOG_HTTP_REQUESTS")
     if env.get("SNAPSHOT_INTERVAL_SECONDS"):
         env_overrides["snapshot_interval_seconds"] = env.get("SNAPSHOT_INTERVAL_SECONDS")
+    if env.get("SNAPSHOT_COMPACTION_ENABLED"):
+        env_overrides["snapshot_compaction_enabled"] = env.get("SNAPSHOT_COMPACTION_ENABLED")
+    if env.get("SNAPSHOT_COMPACTION_INTERVAL_SECONDS"):
+        env_overrides["snapshot_compaction_interval_seconds"] = env.get("SNAPSHOT_COMPACTION_INTERVAL_SECONDS")
+    if env.get("SNAPSHOT_COMPACTION_GRACE_MINUTES"):
+        env_overrides["snapshot_compaction_grace_minutes"] = env.get("SNAPSHOT_COMPACTION_GRACE_MINUTES")
+    if env.get("RESOLVED_COMPACTION_BUCKET_SECONDS_RECENT"):
+        env_overrides["resolved_compaction_bucket_seconds_recent"] = env.get("RESOLVED_COMPACTION_BUCKET_SECONDS_RECENT")
+    if env.get("RESOLVED_COMPACTION_BUCKET_SECONDS_MID"):
+        env_overrides["resolved_compaction_bucket_seconds_mid"] = env.get("RESOLVED_COMPACTION_BUCKET_SECONDS_MID")
+    if env.get("RESOLVED_COMPACTION_BUCKET_SECONDS_OLD"):
+        env_overrides["resolved_compaction_bucket_seconds_old"] = env.get("RESOLVED_COMPACTION_BUCKET_SECONDS_OLD")
 
     merged = _merge_settings(file_overrides, env_overrides)
 
     if merged.get("raw_dir"):
         merged["raw_dir"] = Path(merged["raw_dir"])
+    if merged.get("log_file"):
+        merged["log_file"] = Path(merged["log_file"])
     if merged.get("feature_clob") is not None:
         merged["feature_clob"] = _coerce_bool(merged["feature_clob"])
+    if merged.get("log_to_stdout") is not None:
+        merged["log_to_stdout"] = _coerce_bool(merged["log_to_stdout"])
+    if merged.get("log_http_requests") is not None:
+        merged["log_http_requests"] = _coerce_bool(merged["log_http_requests"])
+    if merged.get("snapshot_compaction_enabled") is not None:
+        merged["snapshot_compaction_enabled"] = _coerce_bool(merged["snapshot_compaction_enabled"])
     for key in ("market_title_contains", "market_filters", "target_market_ids"):
         if merged.get(key) is not None:
             merged[key] = _coerce_str_list(merged.get(key))
@@ -249,7 +301,14 @@ def load_settings(config_path: str | Path | None = None) -> Settings:
         "trades_page_size",
         "book_snapshot_interval_seconds",
         "rate_limit_per_second",
+        "log_rotate_max_mb",
+        "log_rotate_backups",
         "snapshot_interval_seconds",
+        "snapshot_compaction_interval_seconds",
+        "snapshot_compaction_grace_minutes",
+        "resolved_compaction_bucket_seconds_recent",
+        "resolved_compaction_bucket_seconds_mid",
+        "resolved_compaction_bucket_seconds_old",
     ):
         if merged.get(key) is not None:
             merged[key] = _coerce_int(merged[key])

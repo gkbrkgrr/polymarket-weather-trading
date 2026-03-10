@@ -3,7 +3,7 @@ postgres_dsn: postgresql://archive_user:password@127.0.0.1:5432/master_db
 data_base_url: https://data-api.polymarket.com
 clob_base_url: https://clob.polymarket.com
 clob_ws_url: wss://ws-subscriptions-clob.polymarket.com/ws/market
-backfill_start: 2026-01-01T00:00:00Z
+backfill_start: 2026-03-03T00:00:00Z
 
 target_market_ids: []
 market_filters: []
@@ -18,8 +18,22 @@ trades_page_size: 200
 markets_page_size: 500
 request_timeout_seconds: 20
 max_retries: 5
-book_snapshot_interval_seconds: 1
+book_snapshot_interval_seconds: 3
+
+discovery_interval_seconds: 300
+snapshot_compaction_enabled: true
+snapshot_compaction_interval_seconds: 300
+snapshot_compaction_grace_minutes: 60
+resolved_compaction_bucket_seconds_recent: 20
+resolved_compaction_bucket_seconds_mid: 30
+resolved_compaction_bucket_seconds_old: 60
+
 
 raw_dir: data/raw
 log_level: INFO
+log_file: logs/poly_archive.log
+log_to_stdout: false
+log_rotate_max_mb: 128
+log_rotate_backups: 20
+log_http_requests: false
 feature_clob: true

@@ -424,7 +424,7 @@ def apply_policy(
         except Exception:
             now_local = now_utc.astimezone(ZoneInfo("UTC"))
 
-        kill_switch = state_store.is_global_kill() or state_store.is_station_paused(station)
+        kill_switch = state_store.is_global_kill()
         reason = _initial_skip_reason(row, ctx, now_local, kill_switch)
         if reason is None:
             pre_pass[pos] = True

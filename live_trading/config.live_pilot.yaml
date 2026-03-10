@@ -25,14 +25,15 @@ timezones:
   default: Europe/London
   stations: {}
 
-mode_distance_min: 2
-p_model_max: 0.12
-edge_threshold: 0.02
+mode_distance_min: 1
+p_model_max: 0.15
+edge_threshold: 0.01
 max_no_price: 0.92
 max_spread: 0.05
 price_drift_tolerance: 0.01
 max_probability_age_days: 2
-max_snapshot_age_minutes: 30
+max_snapshot_age_minutes: 60
+snapshot_quote_lookback_per_outcome: 12
 pause_on_stale_probabilities: true
 pause_on_stale_snapshots: true
 health_gate_alert_cooldown_minutes: 30
@@ -69,7 +70,7 @@ ensemble_enable_strike_disagreement_veto: true
 ensemble_min_size_multiplier: 0.75
 ensemble_max_size_multiplier: 1.15
 
-stake_fraction: 0.005
+stake_fraction: 0.05
 stake_cap_usd: 50
 drawdown_position_scaling: true
 max_drawdown_fraction: 0.2
@@ -78,9 +79,13 @@ station_daily_risk_fraction: 0.02
 portfolio_daily_risk_fraction: 0.05
 stoploss_daily_pnl_fraction: 0.01
 stoploss_consecutive_days: 3
+trade_stoploss:
+  enabled: true
+  loss_fraction: 0.25
+  break_even_on_recovery: true
 max_open_positions_per_station: 4
 max_open_positions_total: 20
-trade_cooldown_minutes: 30
+trade_cooldown_minutes: 10
 
 slippage_buffer_yes_fallback: 0.01
 min_order_size: 1
@@ -100,6 +105,13 @@ trade_window:
   end_local: "23:59"
 
 log_level: INFO
+log_to_stdout: false
+log_file: logs/live_paper_trade.log
+log_rotate_max_mb: 128
+log_rotate_backups: 20
+log_skip_decisions_at_info: false
+log_cycle_decision_summary: true
+log_cycle_summary_top_skip_reasons: 6
 write_jsonl_log: true
 write_csv_trades: true
 daily_report_time_local: "23:59"

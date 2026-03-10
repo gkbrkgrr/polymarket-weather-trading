@@ -243,6 +243,7 @@ def fetch_latest_snapshots(
     *,
     snapshot_table: SnapshotTableInfo,
     market_ids: list[str],
+    lookback_per_outcome: int = 12,
 ) -> pd.DataFrame:
     market_ids = [str(m) for m in market_ids if str(m).strip()]
     if not market_ids:
@@ -262,25 +263,46 @@ def fetch_latest_snapshots(
             ]
         )
 
+    try:
+        lookback = max(1, int(lookback_per_outcome))
+    except Exception:
+        lookback = 12
+
     query = sql.SQL(
         """
-        SELECT DISTINCT ON (s.market_id, s.outcome_index)
-            s.market_id::text AS market_id,
-            s.ts,
-            s.outcome_index,
-            s.best_bid::double precision AS best_bid,
-            s.best_ask::double precision AS best_ask,
-            s.bid_size::double precision AS bid_size,
-            s.ask_size::double precision AS ask_size
-        FROM {table_name} s
-        WHERE s.market_id = ANY(%(market_ids)s)
-          AND s.outcome_index IN (0, 1)
-        ORDER BY s.market_id, s.outcome_index, s.ts DESC
+        WITH ranked AS (
+            SELECT
+                s.market_id::text AS market_id,
+                s.ts,
+                s.outcome_index,
+                s.best_bid::double precision AS best_bid,
+                s.best_ask::double precision AS best_ask,
+                s.bid_size::double precision AS bid_size,
+                s.ask_size::double precision AS ask_size,
+                ROW_NUMBER() OVER (
+                    PARTITION BY s.market_id, s.outcome_index
+                    ORDER BY s.ts DESC
+                ) AS rn
+            FROM {table_name} s
+            WHERE s.market_id = ANY(%(market_ids)s)
+              AND s.outcome_index IN (0, 1)
+        )
+        SELECT
+            market_id,
+            ts,
+            outcome_index,
+            best_bid,
+            best_ask,
+            bid_size,
+            ask_size
+        FROM ranked
+        WHERE rn <= %(lookback)s
+        ORDER BY market_id, outcome_index, ts DESC
         """
     ).format(table_name=sql.Identifier(snapshot_table.table_name))
 
     with conn.cursor() as cur:
-        cur.execute(query, {"market_ids": market_ids})
+        cur.execute(query, {"market_ids": market_ids, "lookback": lookback})
         rows = cur.fetchall()
         cols = [d.name for d in cur.description]
     raw = pd.DataFrame(rows, columns=cols)
@@ -307,19 +329,35 @@ def fetch_latest_snapshots(
             "no_bid_size": None,
             "no_ask_size": None,
         }
-        for q in grp.itertuples(index=False):
-            if int(q.outcome_index) == 0:
-                row["yes_snapshot_ts_utc"] = q.ts
-                row["best_yes_bid"] = q.best_bid
-                row["best_yes_ask"] = q.best_ask
-                row["yes_bid_size"] = q.bid_size
-                row["yes_ask_size"] = q.ask_size
-            elif int(q.outcome_index) == 1:
-                row["no_snapshot_ts_utc"] = q.ts
-                row["best_no_bid"] = q.best_bid
-                row["best_no_ask"] = q.best_ask
-                row["no_bid_size"] = q.bid_size
-                row["no_ask_size"] = q.ask_size
+
+        yes_grp = grp.loc[grp["outcome_index"] == 0].sort_values("ts", ascending=False, kind="mergesort")
+        if not yes_grp.empty:
+            yes_pick = yes_grp.loc[yes_grp["best_bid"].notna()].head(1)
+            if yes_pick.empty:
+                yes_pick = yes_grp.loc[yes_grp["best_ask"].notna()].head(1)
+            if yes_pick.empty:
+                yes_pick = yes_grp.head(1)
+            q = yes_pick.iloc[0]
+            row["yes_snapshot_ts_utc"] = q["ts"]
+            row["best_yes_bid"] = q["best_bid"]
+            row["best_yes_ask"] = q["best_ask"]
+            row["yes_bid_size"] = q["bid_size"]
+            row["yes_ask_size"] = q["ask_size"]
+
+        no_grp = grp.loc[grp["outcome_index"] == 1].sort_values("ts", ascending=False, kind="mergesort")
+        if not no_grp.empty:
+            no_pick = no_grp.loc[no_grp["best_ask"].notna()].head(1)
+            if no_pick.empty:
+                no_pick = no_grp.loc[no_grp["best_bid"].notna()].head(1)
+            if no_pick.empty:
+                no_pick = no_grp.head(1)
+            q = no_pick.iloc[0]
+            row["no_snapshot_ts_utc"] = q["ts"]
+            row["best_no_bid"] = q["best_bid"]
+            row["best_no_ask"] = q["best_ask"]
+            row["no_bid_size"] = q["bid_size"]
+            row["no_ask_size"] = q["ask_size"]
+
         records.append(row)
 
     out = pd.DataFrame.from_records(records)

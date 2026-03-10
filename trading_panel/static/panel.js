@@ -91,21 +91,37 @@ function renderPanel(payload) {
     plotDiv.className = "station-plot";
     card.appendChild(plotDiv);
 
-    const resolvedMarketRow = document.createElement("div");
-    resolvedMarketRow.className = "resolved-market-row";
+    const marketRowsWrap = document.createElement("div");
+    marketRowsWrap.className = "resolved-market-rows";
 
-    const resolvedLeft = document.createElement("div");
-    resolvedLeft.className = "resolved-market-left";
-    resolvedLeft.textContent =
-      stationData.resolved_yes_market_left || "Max. Temp.: N/A";
+    const marketRows =
+      Array.isArray(stationData.market_rows) && stationData.market_rows.length > 0
+        ? stationData.market_rows
+        : [
+            {
+              left: stationData.resolved_yes_market_left || "Max. Temp.: N/A",
+              right: stationData.resolved_yes_market_right || "",
+            },
+          ];
 
-    const resolvedRight = document.createElement("div");
-    resolvedRight.className = "resolved-market-right";
-    resolvedRight.textContent = stationData.resolved_yes_market_right || "";
+    marketRows.forEach((row) => {
+      const resolvedMarketRow = document.createElement("div");
+      resolvedMarketRow.className = "resolved-market-row";
 
-    resolvedMarketRow.appendChild(resolvedLeft);
-    resolvedMarketRow.appendChild(resolvedRight);
-    card.appendChild(resolvedMarketRow);
+      const resolvedLeft = document.createElement("div");
+      resolvedLeft.className = "resolved-market-left";
+      resolvedLeft.textContent = row.left || "Max. Temp.: N/A";
+
+      const resolvedRight = document.createElement("div");
+      resolvedRight.className = "resolved-market-right";
+      resolvedRight.textContent = row.right || "";
+
+      resolvedMarketRow.appendChild(resolvedLeft);
+      resolvedMarketRow.appendChild(resolvedRight);
+      marketRowsWrap.appendChild(resolvedMarketRow);
+    });
+
+    card.appendChild(marketRowsWrap);
 
     stationsGrid.appendChild(card);
     pendingPlots.push({ plotId, stationData });

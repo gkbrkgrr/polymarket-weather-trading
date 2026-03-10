@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterable, Sequence
 
 from psycopg import AsyncConnection
-from psycopg.errors import UndefinedTable
 from psycopg.types.json import Jsonb
 from psycopg_pool import AsyncConnectionPool
 
@@ -35,11 +35,7 @@ class Database:
             await conn.execute(ddl)
 
     async def ensure_schema(self, schema_path: Path) -> None:
-        try:
-            async with self.connection() as conn:
-                await conn.execute("SELECT 1 FROM markets LIMIT 1")
-        except UndefinedTable:
-            await self.init_db(schema_path)
+        await self.init_db(schema_path)
 
     async def upsert_markets(self, markets: Sequence[GammaMarket]) -> None:
         if not markets:
@@ -234,3 +230,233 @@ class Database:
                 )
             )
         return markets
+
+    async def compact_resolved_book_snapshots(
+        self,
+        *,
+        as_of: datetime | None = None,
+        grace_minutes: int = 60,
+        bucket_seconds_recent: int = 20,
+        bucket_seconds_mid: int = 30,
+        bucket_seconds_old: int = 60,
+    ) -> dict[str, int]:
+        if grace_minutes < 0:
+            raise ValueError("grace_minutes must be >= 0")
+        for value in (bucket_seconds_recent, bucket_seconds_mid, bucket_seconds_old):
+            if int(value) < 1:
+                raise ValueError("bucket seconds must be >= 1")
+        now_utc = (as_of or datetime.now(timezone.utc)).astimezone(timezone.utc)
+        tiers = _resolved_compaction_tiers(
+            now_utc=now_utc,
+            grace_minutes=int(grace_minutes),
+            bucket_seconds_recent=int(bucket_seconds_recent),
+            bucket_seconds_mid=int(bucket_seconds_mid),
+            bucket_seconds_old=int(bucket_seconds_old),
+        )
+        totals: dict[str, int] = {
+            "tiers": 0,
+            "buckets_compacted": 0,
+            "rows_updated": 0,
+            "rows_deleted": 0,
+        }
+        async with self.connection() as conn:
+            await conn.execute(
+                """
+                CREATE TEMP TABLE IF NOT EXISTS _book_snapshot_compact_stage (
+                    market_id TEXT NOT NULL,
+                    outcome_index INT NULL,
+                    bucket_ts TIMESTAMPTZ NOT NULL,
+                    keep_ts TIMESTAMPTZ NOT NULL,
+                    n INT NOT NULL,
+                    first_ts TIMESTAMPTZ NOT NULL,
+                    last_ts TIMESTAMPTZ NOT NULL,
+                    bid_min NUMERIC(10,6) NULL,
+                    bid_max NUMERIC(10,6) NULL,
+                    ask_min NUMERIC(10,6) NULL,
+                    ask_max NUMERIC(10,6) NULL,
+                    mid_min NUMERIC(10,6) NULL,
+                    mid_max NUMERIC(10,6) NULL
+                ) ON COMMIT DROP
+                """
+            )
+            for tier in tiers:
+                stats = await self._compact_resolved_book_snapshots_for_tier(
+                    conn,
+                    bucket_seconds=int(tier["bucket_seconds"]),
+                    resolved_after=tier["resolved_after"],
+                    resolved_before=tier["resolved_before"],
+                )
+                totals["tiers"] += 1
+                totals["buckets_compacted"] += int(stats["buckets_compacted"])
+                totals["rows_updated"] += int(stats["rows_updated"])
+                totals["rows_deleted"] += int(stats["rows_deleted"])
+        return totals
+
+    async def _compact_resolved_book_snapshots_for_tier(
+        self,
+        conn: AsyncConnection,
+        *,
+        bucket_seconds: int,
+        resolved_after: datetime | None,
+        resolved_before: datetime | None,
+    ) -> dict[str, int]:
+        conditions = [
+            "lower(coalesce(m.status, '')) NOT IN ('active', 'open')",
+            "coalesce(m.resolution_time, m.updated_at) IS NOT NULL",
+        ]
+        params: dict[str, object] = {"bucket_seconds": int(bucket_seconds)}
+        if resolved_after is not None:
+            conditions.append("coalesce(m.resolution_time, m.updated_at) > %(resolved_after)s")
+            params["resolved_after"] = resolved_after
+        if resolved_before is not None:
+            conditions.append("coalesce(m.resolution_time, m.updated_at) <= %(resolved_before)s")
+            params["resolved_before"] = resolved_before
+        where_sql = " AND ".join(conditions)
+        bucket_expr = (
+            "to_timestamp(floor(extract(epoch from bs.ts) / %(bucket_seconds)s) * %(bucket_seconds)s)"
+        )
+
+        async with conn.cursor() as cur:
+            await cur.execute("TRUNCATE TABLE _book_snapshot_compact_stage")
+            await cur.execute(
+                f"""
+                INSERT INTO _book_snapshot_compact_stage (
+                    market_id,
+                    outcome_index,
+                    bucket_ts,
+                    keep_ts,
+                    n,
+                    first_ts,
+                    last_ts,
+                    bid_min,
+                    bid_max,
+                    ask_min,
+                    ask_max,
+                    mid_min,
+                    mid_max
+                )
+                SELECT
+                    bs.market_id,
+                    bs.outcome_index,
+                    {bucket_expr} AS bucket_ts,
+                    max(bs.ts) AS keep_ts,
+                    count(*)::INT AS n,
+                    min(bs.ts) AS first_ts,
+                    max(bs.ts) AS last_ts,
+                    min(bs.best_bid) AS bid_min,
+                    max(bs.best_bid) AS bid_max,
+                    min(bs.best_ask) AS ask_min,
+                    max(bs.best_ask) AS ask_max,
+                    min(
+                        CASE
+                            WHEN bs.best_bid IS NOT NULL AND bs.best_ask IS NOT NULL THEN ((bs.best_bid + bs.best_ask) / 2.0)
+                            ELSE NULL
+                        END
+                    ) AS mid_min,
+                    max(
+                        CASE
+                            WHEN bs.best_bid IS NOT NULL AND bs.best_ask IS NOT NULL THEN ((bs.best_bid + bs.best_ask) / 2.0)
+                            ELSE NULL
+                        END
+                    ) AS mid_max
+                FROM book_snapshots bs
+                JOIN markets m ON m.market_id = bs.market_id
+                WHERE {where_sql}
+                GROUP BY bs.market_id, bs.outcome_index, {bucket_expr}
+                HAVING count(*) > 1
+                """,
+                params,
+            )
+            buckets_compacted = int(cur.rowcount or 0)
+            if buckets_compacted == 0:
+                return {"buckets_compacted": 0, "rows_updated": 0, "rows_deleted": 0}
+
+            await cur.execute(
+                """
+                UPDATE book_snapshots bs
+                SET raw = jsonb_build_object(
+                    'v', 1,
+                    'kind', 'book_snapshot_compact',
+                    'bucket_seconds', %(bucket_seconds)s,
+                    'n', s.n,
+                    'first_ts', s.first_ts,
+                    'last_ts', s.last_ts,
+                    'close', jsonb_build_object(
+                        'best_bid', bs.best_bid,
+                        'best_ask', bs.best_ask,
+                        'bid_size', bs.bid_size,
+                        'ask_size', bs.ask_size
+                    ),
+                    'range', jsonb_build_object(
+                        'bid_min', s.bid_min,
+                        'bid_max', s.bid_max,
+                        'ask_min', s.ask_min,
+                        'ask_max', s.ask_max
+                    ),
+                    'mid', jsonb_build_object(
+                        'min', s.mid_min,
+                        'max', s.mid_max
+                    )
+                )
+                FROM _book_snapshot_compact_stage s
+                WHERE bs.market_id = s.market_id
+                  AND bs.outcome_index IS NOT DISTINCT FROM s.outcome_index
+                  AND bs.ts = s.keep_ts
+                """,
+                params,
+            )
+            rows_updated = int(cur.rowcount or 0)
+
+            await cur.execute(
+                """
+                DELETE FROM book_snapshots bs
+                USING _book_snapshot_compact_stage s
+                WHERE bs.market_id = s.market_id
+                  AND bs.outcome_index IS NOT DISTINCT FROM s.outcome_index
+                  AND to_timestamp(
+                        floor(extract(epoch from bs.ts) / %(bucket_seconds)s) * %(bucket_seconds)s
+                      ) = s.bucket_ts
+                  AND bs.ts <> s.keep_ts
+                """,
+                params,
+            )
+            rows_deleted = int(cur.rowcount or 0)
+        return {
+            "buckets_compacted": buckets_compacted,
+            "rows_updated": rows_updated,
+            "rows_deleted": rows_deleted,
+        }
+
+
+def _resolved_compaction_tiers(
+    *,
+    now_utc: datetime,
+    grace_minutes: int,
+    bucket_seconds_recent: int,
+    bucket_seconds_mid: int,
+    bucket_seconds_old: int,
+) -> list[dict[str, object]]:
+    now = now_utc.astimezone(timezone.utc)
+    grace_cutoff = now - timedelta(minutes=max(0, int(grace_minutes)))
+    day_cutoff = now - timedelta(hours=24)
+    week_cutoff = now - timedelta(days=7)
+    return [
+        {
+            "name": "resolved_recent",
+            "bucket_seconds": int(bucket_seconds_recent),
+            "resolved_after": day_cutoff,
+            "resolved_before": grace_cutoff,
+        },
+        {
+            "name": "resolved_mid",
+            "bucket_seconds": int(bucket_seconds_mid),
+            "resolved_after": week_cutoff,
+            "resolved_before": day_cutoff,
+        },
+        {
+            "name": "resolved_old",
+            "bucket_seconds": int(bucket_seconds_old),
+            "resolved_after": None,
+            "resolved_before": week_cutoff,
+        },
+    ]
